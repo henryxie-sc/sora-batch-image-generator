@@ -188,12 +188,21 @@ class AsyncWorker:
                 api_url = "https://yunwu.ai/v1/chat/completions"
             elif self.api_platform == "apicore":
                 api_url = "https://api.apicore.ai/v1/chat/completions"
+            elif self.api_platform == "Gemini Nano Banana":
+                api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key={self.api_key}"
             else:  # API易
                 api_url = "https://vip.apiyi.com/v1/chat/completions"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}"
-            }
+
+            # 设置请求头
+            if self.api_platform == "Gemini Nano Banana":
+                headers = {
+                    "Content-Type": "application/json"
+                }
+            else:
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}"
+                }
             
             # 构建消息内容
             content = [{"type": "text", "text": self.prompt}]
@@ -230,19 +239,75 @@ class AsyncWorker:
                     image_path_info.append(f"网络图片: {img_data['name']} -> {img_data['url']}")
                     logging.info(f"添加网络图片: {img_data['name']} -> {img_data['url']}")
             
-            payload = {
-                "model": "sora_image",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant."
-                    },
-                    {
-                        "role": "user",
-                        "content": content
+            # 构建请求载荷
+            if self.api_platform == "Gemini Nano Banana":
+                # Gemini API 格式
+                gemini_parts = []
+
+                # 添加文本提示
+                gemini_parts.append({"text": self.prompt})
+
+                # 添加图片（Gemini 格式）
+                for img_data in self.image_data:
+                    if 'path' in img_data and img_data['path']:
+                        # 本地图片，转换为base64
+                        local_path = APP_PATH / img_data['path']
+                        if local_path.exists():
+                            # 读取图片并转换为base64
+                            import base64
+                            with open(local_path, 'rb') as f:
+                                img_bytes = f.read()
+                            img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+
+                            # 获取文件扩展名来确定mime_type
+                            file_ext = local_path.suffix.lower()
+                            mime_type = "image/png"  # 默认
+                            if file_ext == '.jpg' or file_ext == '.jpeg':
+                                mime_type = "image/jpeg"
+                            elif file_ext == '.png':
+                                mime_type = "image/png"
+                            elif file_ext == '.webp':
+                                mime_type = "image/webp"
+
+                            gemini_parts.append({
+                                "inline_data": {
+                                    "mime_type": mime_type,
+                                    "data": img_base64
+                                }
+                            })
+
+                            image_path_info.append(f"本地图片: {img_data['name']} -> {img_data['path']}")
+                            logging.info(f"添加本地图片到Gemini: {img_data['name']} -> {img_data['path']}")
+                        else:
+                            logging.warning(f"本地图片文件不存在: {img_data['path']}")
+
+                payload = {
+                    "contents": [{
+                        "parts": gemini_parts
+                    }],
+                    "generation_config": {
+                        "temperature": 1,
+                        "top_p": 0.95,
+                        "top_k": 64,
+                        "max_output_tokens": 8192,
+                        "response_mime_type": "application/json"
                     }
-                ]
-            }
+                }
+            else:
+                # OpenAI 兼容格式（用于云雾、API易、apicore）
+                payload = {
+                    "model": "sora_image",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a helpful assistant."
+                        },
+                        {
+                            "role": "user",
+                            "content": content
+                        }
+                    ]
+                }
             
             # 记录请求信息
             logging.info("发送API请求:")
@@ -309,21 +374,56 @@ class AsyncWorker:
                             
                             response.raise_for_status()
                             data = await response.json()
-                            
-                            # 从返回的markdown中提取图片URL
-                            content = data["choices"][0]["message"]["content"]
-                            
-                            # 尝试两种格式的图片URL
-                            image_url_match = re.search(r'\[点击下载\]\((.*?)\)', content)
-                            if not image_url_match:
-                                image_url_match = re.search(r'!\[图片\]\((.*?)\)', content)
-                            
-                            if image_url_match:
-                                image_url = image_url_match.group(1)
-                                logging.info(f"成功提取图片URL: {image_url}")
-                                self.signals.finished.emit(self.prompt, image_url, self.number or "")
-                                return
+
+                            # 根据平台解析响应
+                            if self.api_platform == "Gemini Nano Banana":
+                                # 解析 Gemini 响应格式
+                                if "candidates" in data and len(data["candidates"]) > 0:
+                                    candidate = data["candidates"][0]
+                                    if "content" in candidate and "parts" in candidate["content"]:
+                                        # 查找图片数据
+                                        for part in candidate["content"]["parts"]:
+                                            if "inline_data" in part:
+                                                # Gemini 直接返回 base64 图片数据
+                                                img_data = part["inline_data"]["data"]
+                                                mime_type = part["inline_data"]["mime_type"]
+
+                                                # 创建临时图片URL（base64格式）
+                                                image_url = f"data:{mime_type};base64,{img_data}"
+
+                                                logging.info(f"Gemini 成功生成图片，大小: {len(img_data)} 字符")
+                                                self.signals.finished.emit(self.prompt, image_url, self.number or "")
+                                                return
+
+                                        # 如果没有找到图片数据，检查文本响应
+                                        for part in candidate["content"]["parts"]:
+                                            if "text" in part:
+                                                text_content = part["text"]
+                                                # 尝试从文本中提取图片URL
+                                                image_url_match = re.search(r'https?://[^\s\)]+(?:\.jpg|\.png|\.jpeg|\.webp)', text_content)
+                                                if image_url_match:
+                                                    image_url = image_url_match.group(0)
+                                                    logging.info(f"从Gemini文本响应中提取图片URL: {image_url}")
+                                                    self.signals.finished.emit(self.prompt, image_url, self.number or "")
+                                                    return
+
+                                raise Exception("Gemini 响应中未找到有效的图片数据")
+
                             else:
+                                # OpenAI 兼容格式的响应解析
+                                content = data["choices"][0]["message"]["content"]
+
+                                # 尝试两种格式的图片URL
+                                image_url_match = re.search(r'\[点击下载\]\((.*?)\)', content)
+                                if not image_url_match:
+                                    image_url_match = re.search(r'!\[图片\]\((.*?)\)', content)
+
+                                if image_url_match:
+                                    image_url = image_url_match.group(1)
+                                    logging.info(f"成功提取图片URL: {image_url}")
+                                    self.signals.finished.emit(self.prompt, image_url, self.number or "")
+                                    return
+
                                 error_msg = "响应中没有找到图片URL"
                                 logging.error(error_msg)
                                 raise ValueError(error_msg)
@@ -379,7 +479,7 @@ class KeyEditDialog(QDialog):
         platform_layout = QHBoxLayout()
         platform_layout.addWidget(QLabel("API平台:"))
         self.platform_combo = QComboBox()
-        self.platform_combo.addItems(["云雾", "API易", "apicore"])
+        self.platform_combo.addItems(["云雾", "API易", "apicore", "Gemini Nano Banana"])
         platform_layout.addWidget(self.platform_combo)
         layout.addLayout(platform_layout)
         
@@ -3704,37 +3804,70 @@ class MainWindow(QMainWindow):
         try:
             # 确保保存目录存在
             os.makedirs(self.save_path, exist_ok=True)
-            
+
             # 生成不重复的文件名
             filename = self.get_unique_filename(number, self.save_path)
             file_path = os.path.join(self.save_path, filename)
-            
-            # 使用aiohttp异步下载图片
-            ssl_context = setup_ssl_context()
-            connector = aiohttp.TCPConnector(ssl=ssl_context)
-            timeout = aiohttp.ClientTimeout(total=300)  # 5分钟超时
-            
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                async with session.get(image_url) as response:
-                    if response.status == 200:
-                        # 使用aiofiles异步写入文件
-                        import aiofiles
-                        async with aiofiles.open(file_path, 'wb') as f:
-                            async for chunk in response.content.iter_chunked(8192):
-                                await f.write(chunk)
-                        
-                        logging.info(f"图片下载成功: {filename}")
-                        logging.info(f"准备调用mark_download_complete，参数: {original_prompt}, 实际文件名: {filename}")
-                        
-                        # 使用信号机制通知主线程，传递实际文件名
-                        try:
-                            self.mark_download_complete(original_prompt, filename)
-                            logging.info(f"直接调用mark_download_complete成功")
-                        except Exception as e:
-                            logging.error(f"直接调用mark_download_complete失败: {e}")
-                    else:
-                        logging.error(f"图片下载失败 - HTTP {response.status}: {image_url}")
-                        QTimer.singleShot(0, lambda: self.mark_download_failed(original_prompt, f"HTTP {response.status}"))
+
+            # 检查是否是base64格式的图片（来自Gemini）
+            if image_url.startswith('data:image/'):
+                # 处理base64格式的图片
+                try:
+                    # 解析base64数据
+                    header, data = image_url.split(',', 1)
+                    import base64
+                    img_data = base64.b64decode(data)
+
+                    # 直接写入文件
+                    import aiofiles
+                    async with aiofiles.open(file_path, 'wb') as f:
+                        await f.write(img_data)
+
+                    logging.info(f"Base64图片保存成功: {filename}")
+                    logging.info(f"准备调用mark_download_complete，参数: {original_prompt}, 实际文件名: {filename}")
+
+                    # 使用信号机制通知主线程，传递实际文件名
+                    try:
+                        self.mark_download_complete(original_prompt, filename)
+                        logging.info(f"mark_download_complete 调用完成")
+                    except Exception as e:
+                        logging.error(f"mark_download_complete 调用失败: {e}")
+                        raise
+
+                    return file_path
+                except Exception as e:
+                    logging.error(f"Base64图片保存失败: {e}")
+                    raise
+            else:
+                # 原有的HTTP下载逻辑
+                # 使用aiohttp异步下载图片
+                ssl_context = setup_ssl_context()
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                timeout = aiohttp.ClientTimeout(total=300)  # 5分钟超时
+
+                async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                    async with session.get(image_url) as response:
+                        if response.status == 200:
+                            # 使用aiofiles异步写入文件
+                            import aiofiles
+                            async with aiofiles.open(file_path, 'wb') as f:
+                                async for chunk in response.content.iter_chunked(8192):
+                                    await f.write(chunk)
+
+                            logging.info(f"图片下载成功: {filename}")
+                            logging.info(f"准备调用mark_download_complete，参数: {original_prompt}, 实际文件名: {filename}")
+
+                            # 使用信号机制通知主线程，传递实际文件名
+                            try:
+                                self.mark_download_complete(original_prompt, filename)
+                                logging.info(f"直接调用mark_download_complete成功")
+                            except Exception as e:
+                                logging.error(f"直接调用mark_download_complete失败: {e}")
+
+                            return file_path
+                        else:
+                            logging.error(f"图片下载失败 - HTTP {response.status}: {image_url}")
+                            QTimer.singleShot(0, lambda: self.mark_download_failed(original_prompt, f"HTTP {response.status}"))
                         
         except Exception as e:
             error_msg = f"保存图片失败: {str(e)}"
