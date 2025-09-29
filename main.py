@@ -165,11 +165,12 @@ class WorkerSignals(QObject):
 
 class AsyncWorker:
     """异步Worker类，使用协程替代线程"""
-    def __init__(self, prompt, api_key, image_data=None, api_platform="云雾", retry_count=3, number=None, signals=None):
+    def __init__(self, prompt, api_key, image_data=None, api_platform="云雾", model_type="sora_image", retry_count=3, number=None, signals=None):
         self.prompt = prompt
         self.api_key = api_key
         self.image_data = image_data or []  # 现在包含{'name': '', 'url': '', 'path': ''} 的数据
         self.api_platform = api_platform
+        self.model_type = model_type
         self.retry_count = retry_count
         self.number = number
         self.signals = signals  # 从外部传入信号对象
@@ -535,6 +536,7 @@ class SettingsDialog(QDialog):
         if parent:
             self.api_key = parent.api_key
             self.api_platform = parent.api_platform
+            self.model_type = parent.model_type
             self.thread_count = parent.thread_count
             self.retry_count = parent.retry_count
             self.save_path = parent.save_path
@@ -548,6 +550,7 @@ class SettingsDialog(QDialog):
         else:
             self.api_key = ""
             self.api_platform = "云雾"
+            self.model_type = "sora_image"
             self.thread_count = 5
             self.retry_count = 3
             self.save_path = ""
@@ -1087,6 +1090,7 @@ class SettingsDialog(QDialog):
         """确定：保存设置并关闭"""
         if self.parent():
             # 更新主窗口的配置
+            self.parent().model_type = self.model_type
             self.parent().thread_count = self.thread_spin.value()
             self.parent().retry_count = self.retry_spin.value()
             self.parent().save_path = self.path_input.text()
@@ -2334,6 +2338,7 @@ class MainWindow(QMainWindow):
         # 配置变量
         self.api_key = ""
         self.api_platform = "云雾"
+        self.model_type = "sora_image"  # 默认使用sora_image模型
         self.thread_count = 5
         self.retry_count = 3
         self.save_path = ""
@@ -2818,7 +2823,7 @@ class MainWindow(QMainWindow):
         signals.progress.connect(lambda p, status: self.handle_progress(p, status, original_prompt))
         
         # 创建异步Worker
-        worker = AsyncWorker(prompt, self.api_key, image_data_list, self.api_platform, self.retry_count, number, signals)
+        worker = AsyncWorker(prompt, self.api_key, image_data_list, self.api_platform, self.model_type, self.retry_count, number, signals)
         
         # 控制并发数量
         if not self.semaphore:
@@ -3971,6 +3976,7 @@ class MainWindow(QMainWindow):
             default_config = {
                 'api_key': '',
                 'api_platform': '云雾',
+                'model_type': 'sora_image',
                 'thread_count': 5,
                 'retry_count': 3,
                 'save_path': '',
@@ -4021,6 +4027,7 @@ class MainWindow(QMainWindow):
                 config = json.load(f)
                 self.api_key = config.get('api_key', '')
                 self.api_platform = config.get('api_platform', '云雾')
+                self.model_type = config.get('model_type', 'sora_image')
                 self.thread_count = config.get('thread_count', 5)
                 self.retry_count = config.get('retry_count', 3)
                 self.save_path = config.get('save_path', '')
@@ -4067,6 +4074,7 @@ class MainWindow(QMainWindow):
             config = {
                 'api_key': self.api_key,
                 'api_platform': self.api_platform,
+                'model_type': self.model_type,
                 'thread_count': self.thread_count,
                 'retry_count': self.retry_count,
                 'save_path': self.save_path,
