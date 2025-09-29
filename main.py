@@ -183,26 +183,29 @@ class AsyncWorker:
             if not self.api_key:
                 raise ValueError("API密钥不能为空")
                 
-            # 构建API请求
-            if self.api_platform == "云雾":
-                api_url = "https://yunwu.ai/v1/chat/completions"
-            elif self.api_platform == "apicore":
-                api_url = "https://api.apicore.ai/v1/chat/completions"
-            elif self.api_platform == "Gemini Nano Banana":
-                api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key={self.api_key}"
-            else:  # API易
-                api_url = "https://vip.apiyi.com/v1/chat/completions"
+            # 构建API请求 - 根据模型类型选择端点
+            if self.model_type == "nano-banana":
+                # nano-banana模型使用fal-ai端点
+                if self.api_platform == "云雾":
+                    api_url = "https://yunwu.ai/fal-ai/nano-banana"
+                elif self.api_platform == "apicore":
+                    api_url = "https://api.apicore.ai/fal-ai/nano-banana"
+                else:  # API易
+                    api_url = "https://vip.apiyi.com/fal-ai/nano-banana"
+            else:
+                # sora_image模型使用标准端点
+                if self.api_platform == "云雾":
+                    api_url = "https://yunwu.ai/v1/chat/completions"
+                elif self.api_platform == "apicore":
+                    api_url = "https://api.apicore.ai/v1/chat/completions"
+                else:  # API易
+                    api_url = "https://vip.apiyi.com/v1/chat/completions"
 
             # 设置请求头
-            if self.api_platform == "Gemini Nano Banana":
-                headers = {
-                    "Content-Type": "application/json"
-                }
-            else:
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}"
-                }
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
             
             # 构建消息内容
             content = [{"type": "text", "text": self.prompt}]
@@ -239,62 +242,24 @@ class AsyncWorker:
                     image_path_info.append(f"网络图片: {img_data['name']} -> {img_data['url']}")
                     logging.info(f"添加网络图片: {img_data['name']} -> {img_data['url']}")
             
-            # 构建请求载荷
-            if self.api_platform == "Gemini Nano Banana":
-                # Gemini API 格式
-                gemini_parts = []
-
-                # 添加文本提示
-                gemini_parts.append({"text": self.prompt})
-
-                # 添加图片（Gemini 格式）
-                for img_data in self.image_data:
-                    if 'path' in img_data and img_data['path']:
-                        # 本地图片，转换为base64
-                        local_path = APP_PATH / img_data['path']
-                        if local_path.exists():
-                            # 读取图片并转换为base64
-                            import base64
-                            with open(local_path, 'rb') as f:
-                                img_bytes = f.read()
-                            img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-
-                            # 获取文件扩展名来确定mime_type
-                            file_ext = local_path.suffix.lower()
-                            mime_type = "image/png"  # 默认
-                            if file_ext == '.jpg' or file_ext == '.jpeg':
-                                mime_type = "image/jpeg"
-                            elif file_ext == '.png':
-                                mime_type = "image/png"
-                            elif file_ext == '.webp':
-                                mime_type = "image/webp"
-
-                            gemini_parts.append({
-                                "inline_data": {
-                                    "mime_type": mime_type,
-                                    "data": img_base64
-                                }
-                            })
-
-                            image_path_info.append(f"本地图片: {img_data['name']} -> {img_data['path']}")
-                            logging.info(f"添加本地图片到Gemini: {img_data['name']} -> {img_data['path']}")
-                        else:
-                            logging.warning(f"本地图片文件不存在: {img_data['path']}")
-
+            # 构建请求载荷 - 根据模型类型选择格式
+            if self.model_type == "nano-banana":
+                # nano-banana模型使用特定格式
                 payload = {
-                    "contents": [{
-                        "parts": gemini_parts
-                    }],
-                    "generation_config": {
-                        "temperature": 1,
-                        "top_p": 0.95,
-                        "top_k": 64,
-                        "max_output_tokens": 8192,
-                        "response_mime_type": "application/json"
-                    }
+                    "model": "nano-banana",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a helpful assistant."
+                        },
+                        {
+                            "role": "user",
+                            "content": content
+                        }
+                    ]
                 }
             else:
-                # OpenAI 兼容格式（用于云雾、API易、apicore）
+                # sora_image模型使用标准格式
                 payload = {
                     "model": "sora_image",
                     "messages": [
@@ -375,58 +340,23 @@ class AsyncWorker:
                             response.raise_for_status()
                             data = await response.json()
 
-                            # 根据平台解析响应
-                            if self.api_platform == "Gemini Nano Banana":
-                                # 解析 Gemini 响应格式
-                                if "candidates" in data and len(data["candidates"]) > 0:
-                                    candidate = data["candidates"][0]
-                                    if "content" in candidate and "parts" in candidate["content"]:
-                                        # 查找图片数据
-                                        for part in candidate["content"]["parts"]:
-                                            if "inline_data" in part:
-                                                # Gemini 直接返回 base64 图片数据
-                                                img_data = part["inline_data"]["data"]
-                                                mime_type = part["inline_data"]["mime_type"]
+                            # 使用标准OpenAI兼容格式解析响应（适用于所有模型）
+                            content = data["choices"][0]["message"]["content"]
 
-                                                # 创建临时图片URL（base64格式）
-                                                image_url = f"data:{mime_type};base64,{img_data}"
+                            # 尝试两种格式的图片URL
+                            image_url_match = re.search(r'\[点击下载\]\((.*?)\)', content)
+                            if not image_url_match:
+                                image_url_match = re.search(r'!\[图片\]\((.*?)\)', content)
 
-                                                logging.info(f"Gemini 成功生成图片，大小: {len(img_data)} 字符")
-                                                self.signals.finished.emit(self.prompt, image_url, self.number or "")
-                                                return
+                            if image_url_match:
+                                image_url = image_url_match.group(1)
+                                logging.info(f"成功提取图片URL: {image_url}")
+                                self.signals.finished.emit(self.prompt, image_url, self.number or "")
+                                return
 
-                                        # 如果没有找到图片数据，检查文本响应
-                                        for part in candidate["content"]["parts"]:
-                                            if "text" in part:
-                                                text_content = part["text"]
-                                                # 尝试从文本中提取图片URL
-                                                image_url_match = re.search(r'https?://[^\s\)]+(?:\.jpg|\.png|\.jpeg|\.webp)', text_content)
-                                                if image_url_match:
-                                                    image_url = image_url_match.group(0)
-                                                    logging.info(f"从Gemini文本响应中提取图片URL: {image_url}")
-                                                    self.signals.finished.emit(self.prompt, image_url, self.number or "")
-                                                    return
-
-                                raise Exception("Gemini 响应中未找到有效的图片数据")
-
-                            else:
-                                # OpenAI 兼容格式的响应解析
-                                content = data["choices"][0]["message"]["content"]
-
-                                # 尝试两种格式的图片URL
-                                image_url_match = re.search(r'\[点击下载\]\((.*?)\)', content)
-                                if not image_url_match:
-                                    image_url_match = re.search(r'!\[图片\]\((.*?)\)', content)
-
-                                if image_url_match:
-                                    image_url = image_url_match.group(1)
-                                    logging.info(f"成功提取图片URL: {image_url}")
-                                    self.signals.finished.emit(self.prompt, image_url, self.number or "")
-                                    return
-
-                                error_msg = "响应中没有找到图片URL"
-                                logging.error(error_msg)
-                                raise ValueError(error_msg)
+                            error_msg = "响应中没有找到图片URL"
+                            logging.error(error_msg)
+                            raise ValueError(error_msg)
                         
                 except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
                     retry_times += 1
@@ -479,7 +409,7 @@ class KeyEditDialog(QDialog):
         platform_layout = QHBoxLayout()
         platform_layout.addWidget(QLabel("API平台:"))
         self.platform_combo = QComboBox()
-        self.platform_combo.addItems(["云雾", "API易", "apicore", "Gemini Nano Banana"])
+        self.platform_combo.addItems(["云雾", "API易", "apicore"])
         platform_layout.addWidget(self.platform_combo)
         layout.addLayout(platform_layout)
         
