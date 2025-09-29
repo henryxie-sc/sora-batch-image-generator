@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Log files
+*.log
+sora_generator.log
+
+# Configuration files with sensitive data
+config.json
+
+# Generated images (if stored locally)
+images/
+generated_images/
+output/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Windows batch files might contain sensitive paths
+*.bat

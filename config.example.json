@@ -1,0 +1,35 @@
+{
+  "api_key": "your-api-key-here",
+  "api_platform": "云雾",
+  "thread_count": 5,
+  "retry_count": 3,
+  "save_path": "/path/to/your/image/folder",
+  "image_ratio": "2:3",
+  "style_library": {
+    "超写实风格": {
+      "name": "超写实风格",
+      "content": "极致的超写实主义照片风格，画面呈现出顶级数码单反相机的拍摄效果...",
+      "category": "摄影风格",
+      "created_time": "2024-01-01 12:00:00",
+      "usage_count": 0
+    },
+    "动漫风格": {
+      "name": "动漫风格",
+      "content": "二次元动漫风格，色彩鲜艳饱满，线条清晰...",
+      "category": "插画风格",
+      "created_time": "2024-01-01 12:01:00",
+      "usage_count": 0
+    }
+  },
+  "current_style": "超写实风格",
+  "custom_style_content": "",
+  "window_geometry": {
+    "width": 1470,
+    "height": 816,
+    "x": 0,
+    "y": 34
+  },
+  "category_links": {},
+  "key_library": {},
+  "current_key_name": ""
+}
