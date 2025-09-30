@@ -23,6 +23,20 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSize
 from PyQt6.QtGui import QPixmap, QImage, QFont, QPalette, QColor, QIcon, QTextOption
 
+# 自定义checkbox类，避免lambda闭包问题
+class RowCheckBox(QCheckBox):
+    """带有行号的checkbox"""
+    row_state_changed = pyqtSignal(int, bool)  # 行号, 是否选中
+
+    def __init__(self, row, parent=None):
+        super().__init__(parent)
+        self.row = row
+        self.stateChanged.connect(self._on_state_changed)
+
+    def _on_state_changed(self, state):
+        """状态改变时发出带行号的信号"""
+        self.row_state_changed.emit(self.row, state == Qt.CheckState.Checked)
+
 # 导入声音播放模块
 try:
     import winsound  # Windows系统声音
@@ -150,6 +164,177 @@ def image_to_base64(image_path):
         logging.error(f"转换图片为base64失败: {e}")
         return None
 
+def ensure_history_directory():
+    """确保历史记录目录存在"""
+    history_path = APP_PATH / 'history'
+    if not history_path.exists():
+        history_path.mkdir(parents=True, exist_ok=True)
+        logging.info(f"创建历史记录目录: {history_path}")
+    return history_path
+
+def save_history_record(prompt_data, config_data, filename=None):
+    """保存历史记录到JSON文件，自动去重"""
+    import hashlib
+    import glob
+
+    try:
+        history_path = ensure_history_directory()
+
+        # 构建历史记录数据
+        history_record = {
+            'version': '3.4',
+            'created_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'total_prompts': len(prompt_data),
+            'success_count': len([p for p in prompt_data if p.get('status') == '成功']),
+            'failed_count': len([p for p in prompt_data if p.get('status') == '失败']),
+            'config': {
+                'api_platform': config_data.get('api_platform', ''),
+                'model_type': config_data.get('model_type', ''),
+                'thread_count': config_data.get('thread_count', 5),
+                'retry_count': config_data.get('retry_count', 3),
+                'image_ratio': config_data.get('image_ratio', '3:2'),
+                'current_style': config_data.get('current_style', ''),
+                'custom_style_content': config_data.get('custom_style_content', '')
+            },
+            'prompts': prompt_data
+        }
+
+        # 计算内容哈希值（仅基于配置和提示词，不包括时间戳和状态统计）
+        content_for_hash = {
+            'config': history_record['config'],
+            'prompts': [{'prompt': p.get('prompt', '')} for p in prompt_data]  # 只取提示词内容
+        }
+        content_str = json.dumps(content_for_hash, sort_keys=True, ensure_ascii=False)
+        content_hash = hashlib.md5(content_str.encode('utf-8')).hexdigest()
+
+        # 检查现有文件是否有相同内容
+        existing_files = glob.glob(str(history_path / "sora_history_*.json"))
+        duplicate_file = None
+
+        for existing_file in existing_files:
+            try:
+                with open(existing_file, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+
+                # 计算现有文件的哈希值
+                existing_content = {
+                    'config': existing_data.get('config', {}),
+                    'prompts': [{'prompt': p.get('prompt', '')} for p in existing_data.get('prompts', [])]
+                }
+                existing_str = json.dumps(existing_content, sort_keys=True, ensure_ascii=False)
+                existing_hash = hashlib.md5(existing_str.encode('utf-8')).hexdigest()
+
+                if existing_hash == content_hash:
+                    duplicate_file = existing_file
+                    break
+
+            except (json.JSONDecodeError, IOError, KeyError):
+                # 如果读取失败，忽略该文件
+                continue
+
+        # 如果找到重复文件，更新时间戳
+        if duplicate_file:
+            logging.info(f"发现重复内容，更新现有文件: {duplicate_file}")
+            # 更新现有文件的时间戳和统计信息
+            try:
+                with open(duplicate_file, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+
+                # 更新时间戳和统计信息，保持其他内容不变
+                existing_data['created_time'] = history_record['created_time']
+                existing_data['total_prompts'] = history_record['total_prompts']
+                existing_data['success_count'] = history_record['success_count']
+                existing_data['failed_count'] = history_record['failed_count']
+                existing_data['prompts'] = prompt_data  # 更新完整的提示词数据（包括状态）
+
+                with open(duplicate_file, 'w', encoding='utf-8') as f:
+                    json.dump(existing_data, f, indent=2, ensure_ascii=False)
+
+                logging.info(f"历史记录已更新: {duplicate_file}")
+                return str(duplicate_file)
+
+            except Exception as e:
+                logging.error(f"更新重复文件失败: {e}")
+                # 如果更新失败，继续创建新文件
+
+        # 如果没有重复文件，创建新文件
+        if not filename:
+            timestamp = time.strftime('%Y%m%d_%H%M%S')
+            filename = f"sora_history_{timestamp}.json"
+
+        # 确保文件名以.json结尾
+        if not filename.endswith('.json'):
+            filename += '.json'
+
+        file_path = history_path / filename
+
+        # 保存到文件
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(history_record, f, indent=2, ensure_ascii=False)
+
+        logging.info(f"历史记录已保存: {file_path}")
+        return str(file_path)
+
+    except Exception as e:
+        logging.error(f"保存历史记录失败: {e}")
+        return None
+
+def load_history_record(file_path):
+    """从JSON文件加载历史记录"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            history_record = json.load(f)
+
+        logging.info(f"历史记录已加载: {file_path}")
+        return history_record
+
+    except Exception as e:
+        logging.error(f"加载历史记录失败: {e}")
+        return None
+
+def get_history_files():
+    """获取所有历史记录文件"""
+    try:
+        history_path = ensure_history_directory()
+        history_files = []
+
+        for file_path in history_path.glob('*.json'):
+            try:
+                # 读取文件的基本信息
+                stat = file_path.stat()
+                file_info = {
+                    'path': str(file_path),
+                    'name': file_path.name,
+                    'size': stat.st_size,
+                    'modified_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))
+                }
+
+                # 尝试读取文件内容获取更多信息
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    file_info.update({
+                        'created_time': data.get('created_time', file_info['modified_time']),
+                        'version': data.get('version', '未知'),
+                        'total_prompts': data.get('total_prompts', 0),
+                        'success_count': data.get('success_count', 0),
+                        'failed_count': data.get('failed_count', 0)
+                    })
+
+                history_files.append(file_info)
+
+            except Exception as e:
+                # 如果读取单个文件失败，继续处理其他文件
+                logging.warning(f"读取历史文件失败: {file_path}, 错误: {e}")
+                continue
+
+        # 按修改时间排序，最新的在前
+        history_files.sort(key=lambda x: x['modified_time'], reverse=True)
+        return history_files
+
+    except Exception as e:
+        logging.error(f"获取历史文件列表失败: {e}")
+        return []
+
 # 配置日志
 logging.basicConfig(
     filename=APP_PATH / 'sora_generator.log',
@@ -184,23 +369,13 @@ class AsyncWorker:
             if not self.api_key:
                 raise ValueError("API密钥不能为空")
                 
-            # 构建API请求 - 根据模型类型选择端点
-            if self.model_type == "nano-banana":
-                # nano-banana模型使用fal-ai端点
-                if self.api_platform == "云雾":
-                    api_url = "https://yunwu.ai/fal-ai/nano-banana"
-                elif self.api_platform == "apicore":
-                    api_url = "https://api.apicore.ai/fal-ai/nano-banana"
-                else:  # API易
-                    api_url = "https://vip.apiyi.com/fal-ai/nano-banana"
-            else:
-                # sora_image模型使用标准端点
-                if self.api_platform == "云雾":
-                    api_url = "https://yunwu.ai/v1/chat/completions"
-                elif self.api_platform == "apicore":
-                    api_url = "https://api.apicore.ai/v1/chat/completions"
-                else:  # API易
-                    api_url = "https://vip.apiyi.com/v1/chat/completions"
+            # 构建API请求 - 所有模型都使用标准端点
+            if self.api_platform == "云雾":
+                api_url = "https://yunwu.ai/v1/chat/completions"
+            elif self.api_platform == "apicore":
+                api_url = "https://api.apicore.ai/v1/chat/completions"
+            else:  # API易
+                api_url = "https://vip.apiyi.com/v1/chat/completions"
 
             # 设置请求头
             headers = {
@@ -245,9 +420,9 @@ class AsyncWorker:
             
             # 构建请求载荷 - 根据模型类型选择格式
             if self.model_type == "nano-banana":
-                # nano-banana模型使用特定格式
+                # nano-banana模型使用Gemini 2.5 Flash Image Preview
                 payload = {
-                    "model": "nano-banana",
+                    "model": "gemini-2.5-flash-image-preview",
                     "messages": [
                         {
                             "role": "system",
@@ -344,20 +519,65 @@ class AsyncWorker:
                             # 使用标准OpenAI兼容格式解析响应（适用于所有模型）
                             content = data["choices"][0]["message"]["content"]
 
-                            # 尝试两种格式的图片URL
-                            image_url_match = re.search(r'\[点击下载\]\((.*?)\)', content)
-                            if not image_url_match:
-                                image_url_match = re.search(r'!\[图片\]\((.*?)\)', content)
+                            # 记录完整响应内容用于调试
+                            logging.info(f"API响应内容 ({self.model_type}): {content}")
 
-                            if image_url_match:
-                                image_url = image_url_match.group(1)
-                                logging.info(f"成功提取图片URL: {image_url}")
-                                self.signals.finished.emit(self.prompt, image_url, self.number or "")
-                                return
+                            # 根据模型类型使用不同的解析策略
+                            if self.model_type == "nano-banana":
+                                # nano-banana (Gemini) 模型可能直接返回base64图片数据或不同格式
+                                image_url = None
 
-                            error_msg = "响应中没有找到图片URL"
-                            logging.error(error_msg)
-                            raise ValueError(error_msg)
+                                # 1. 检查是否包含base64数据
+                                base64_match = re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', content)
+                                if base64_match:
+                                    image_url = base64_match.group(0)  # 完整的data:image格式
+                                    logging.info(f"找到base64图片数据: {image_url[:100]}...")
+                                else:
+                                    # 2. 尝试常见的URL格式
+                                    url_patterns = [
+                                        r'\[点击下载\]\((.*?)\)',
+                                        r'!\[图片\]\((.*?)\)',
+                                        r'!\[.*?\]\((.*?)\)',
+                                        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
+                                        r'generated_image[^\\s]*\.(?:png|jpg|jpeg|gif|webp)',
+                                        r'https://[^\\s]+\.(?:png|jpg|jpeg|gif|webp)',
+                                    ]
+
+                                    for pattern in url_patterns:
+                                        match = re.search(pattern, content)
+                                        if match:
+                                            if pattern.startswith('http'):
+                                                image_url = match.group(0)
+                                            else:
+                                                image_url = match.group(1)
+                                            logging.info(f"使用模式 '{pattern}' 找到图片URL: {image_url}")
+                                            break
+
+                                if image_url:
+                                    self.signals.finished.emit(self.prompt, image_url, self.number or "")
+                                    return
+                                else:
+                                    # 如果都没找到，记录完整响应用于调试
+                                    logging.error(f"nano-banana模型响应解析失败，完整响应: {content}")
+                                    error_msg = f"nano-banana模型响应中没有找到图片数据。响应内容: {content[:200]}..."
+                                    logging.error(error_msg)
+                                    raise ValueError(error_msg)
+
+                            else:
+                                # sora_image 模型使用原有逻辑
+                                image_url_match = re.search(r'\[点击下载\]\((.*?)\)', content)
+                                if not image_url_match:
+                                    image_url_match = re.search(r'!\[图片\]\((.*?)\)', content)
+
+                                if image_url_match:
+                                    image_url = image_url_match.group(1)
+                                    logging.info(f"成功提取图片URL: {image_url}")
+                                    self.signals.finished.emit(self.prompt, image_url, self.number or "")
+                                    return
+
+                                error_msg = f"sora_image模型响应中没有找到图片URL。响应内容: {content[:200]}..."
+                                logging.error(error_msg)
+                                raise ValueError(error_msg)
                         
                 except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
                     retry_times += 1
@@ -689,6 +909,11 @@ class SettingsDialog(QDialog):
         self.ratio_combo = QComboBox()
         self.ratio_combo.addItems(["3:2", "2:3"])
         params_layout.addWidget(self.ratio_combo, 1, 1)
+
+        params_layout.addWidget(QLabel("模型类型:"), 1, 2)
+        self.model_combo = QComboBox()
+        self.model_combo.addItems(["sora_image", "nano-banana"])
+        params_layout.addWidget(self.model_combo, 1, 3)
         
         layout.addWidget(params_group)
         
@@ -1069,6 +1294,7 @@ class SettingsDialog(QDialog):
         self.retry_spin.setValue(self.retry_count)
         self.path_input.setText(self.save_path)
         self.ratio_combo.setCurrentText(self.image_ratio)
+        self.model_combo.setCurrentText(self.model_type)
         
         # 风格库
         self.refresh_style_combo()
@@ -1090,7 +1316,7 @@ class SettingsDialog(QDialog):
         """确定：保存设置并关闭"""
         if self.parent():
             # 更新主窗口的配置
-            self.parent().model_type = self.model_type
+            self.parent().model_type = self.model_combo.currentText()
             self.parent().thread_count = self.thread_spin.value()
             self.parent().retry_count = self.retry_spin.value()
             self.parent().save_path = self.path_input.text()
@@ -2152,95 +2378,928 @@ class PromptEditDialog(QDialog):
         """获取编辑后的文本"""
         return self.text_edit.toPlainText().strip()
 
-class ImageViewDialog(QDialog):
-    """图片查看对话框"""
-    
+class BatchEditDialog(QDialog):
+    """批量编辑提示词对话框"""
+
+    def __init__(self, selected_prompts, parent=None):
+        super().__init__(parent)
+        self.selected_prompts = selected_prompts
+        self.setWindowTitle("📝 批量编辑提示词")
+        self.resize(600, 500)
+        self.setMinimumSize(500, 400)
+        self.setModal(True)
+
+        self.setup_ui()
+
+        # 设置样式
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f5f5f5;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #ddd;
+                border-radius: 8px;
+                margin-top: 1ex;
+                padding-top: 10px;
+                background-color: white;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+                color: #333;
+            }
+            QPushButton {
+                background-color: #1976d2;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #1565c0;
+            }
+            QPushButton:pressed {
+                background-color: #0d47a1;
+            }
+            QLineEdit, QTextEdit {
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: white;
+            }
+            QLineEdit:focus, QTextEdit:focus {
+                border-color: #1976d2;
+            }
+        """)
+
+    def setup_ui(self):
+        """设置UI界面"""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # 标题
+        title_label = QLabel(f"📝 批量编辑 {len(self.selected_prompts)} 个提示词")
+        title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #333; margin-bottom: 10px;")
+        layout.addWidget(title_label)
+
+        # 操作选择
+        operation_group = QGroupBox("🛠️ 选择操作类型")
+        operation_layout = QVBoxLayout(operation_group)
+
+        self.operation_combo = QComboBox()
+        self.operation_combo.addItems([
+            "添加前缀 - 在提示词前面添加文本",
+            "添加后缀 - 在提示词后面添加文本",
+            "查找替换 - 将指定文本替换为新文本",
+            "删除文本 - 删除提示词中的指定文本"
+        ])
+        self.operation_combo.currentTextChanged.connect(self.on_operation_changed)
+        operation_layout.addWidget(self.operation_combo)
+
+        layout.addWidget(operation_group)
+
+        # 输入区域（动态变化）
+        self.input_group = QGroupBox("📝 输入内容")
+        self.input_layout = QVBoxLayout(self.input_group)
+        layout.addWidget(self.input_group)
+
+        # 预览区域
+        preview_group = QGroupBox("👁️ 预览效果")
+        preview_layout = QVBoxLayout(preview_group)
+
+        self.preview_text = QTextEdit()
+        self.preview_text.setMaximumHeight(150)
+        self.preview_text.setReadOnly(True)
+        self.preview_text.setPlaceholderText("选择操作类型并输入内容后，此处将显示预览效果...")
+        preview_layout.addWidget(self.preview_text)
+
+        layout.addWidget(preview_group)
+
+        # 按钮区域
+        button_layout = QHBoxLayout()
+
+        self.preview_button = QPushButton("👁️ 刷新预览")
+        self.preview_button.clicked.connect(self.update_preview)
+        button_layout.addWidget(self.preview_button)
+
+        button_layout.addStretch()
+
+        self.cancel_button = QPushButton("❌ 取消")
+        self.cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(self.cancel_button)
+
+        self.apply_button = QPushButton("✅ 应用修改")
+        self.apply_button.clicked.connect(self.accept)
+        self.apply_button.setDefault(True)
+        button_layout.addWidget(self.apply_button)
+
+        layout.addLayout(button_layout)
+
+        # 初始化输入区域
+        self.on_operation_changed()
+
+    def on_operation_changed(self):
+        """操作类型改变时更新输入界面"""
+        # 清空输入区域
+        for i in reversed(range(self.input_layout.count())):
+            child = self.input_layout.itemAt(i).widget()
+            if child:
+                child.setParent(None)
+
+        operation = self.operation_combo.currentText()
+
+        if operation.startswith("添加前缀"):
+            # 前缀输入
+            self.input_layout.addWidget(QLabel("要添加的前缀内容:"))
+            self.prefix_input = QLineEdit()
+            self.prefix_input.setPlaceholderText("例如: 高质量, ")
+            self.prefix_input.textChanged.connect(self.update_preview)
+            self.input_layout.addWidget(self.prefix_input)
+
+        elif operation.startswith("添加后缀"):
+            # 后缀输入
+            self.input_layout.addWidget(QLabel("要添加的后缀内容:"))
+            self.suffix_input = QLineEdit()
+            self.suffix_input.setPlaceholderText("例如: , 8K画质")
+            self.suffix_input.textChanged.connect(self.update_preview)
+            self.input_layout.addWidget(self.suffix_input)
+
+        elif operation.startswith("查找替换"):
+            # 查找替换输入
+            self.input_layout.addWidget(QLabel("要查找的文本:"))
+            self.find_input = QLineEdit()
+            self.find_input.setPlaceholderText("输入要查找的文本...")
+            self.find_input.textChanged.connect(self.update_preview)
+            self.input_layout.addWidget(self.find_input)
+
+            self.input_layout.addWidget(QLabel("替换为:"))
+            self.replace_input = QLineEdit()
+            self.replace_input.setPlaceholderText("输入替换后的文本...")
+            self.replace_input.textChanged.connect(self.update_preview)
+            self.input_layout.addWidget(self.replace_input)
+
+        elif operation.startswith("删除文本"):
+            # 删除文本输入
+            self.input_layout.addWidget(QLabel("要删除的文本:"))
+            self.delete_input = QLineEdit()
+            self.delete_input.setPlaceholderText("输入要删除的文本...")
+            self.delete_input.textChanged.connect(self.update_preview)
+            self.input_layout.addWidget(self.delete_input)
+
+        # 自动更新预览
+        self.update_preview()
+
+    def update_preview(self):
+        """更新预览效果"""
+        operation = self.operation_combo.currentText()
+
+        # 处理前3个提示词作为预览
+        preview_prompts = self.selected_prompts[:3]
+        preview_results = []
+
+        try:
+            for prompt in preview_prompts:
+                if operation.startswith("添加前缀"):
+                    prefix = getattr(self, 'prefix_input', None)
+                    if prefix and prefix.text().strip():
+                        new_prompt = prefix.text().strip() + prompt
+                    else:
+                        new_prompt = prompt
+
+                elif operation.startswith("添加后缀"):
+                    suffix = getattr(self, 'suffix_input', None)
+                    if suffix and suffix.text().strip():
+                        new_prompt = prompt + suffix.text().strip()
+                    else:
+                        new_prompt = prompt
+
+                elif operation.startswith("查找替换"):
+                    find_text = getattr(self, 'find_input', None)
+                    replace_text = getattr(self, 'replace_input', None)
+                    if find_text and replace_text:
+                        find_str = find_text.text()
+                        replace_str = replace_text.text()
+                        if find_str:
+                            new_prompt = prompt.replace(find_str, replace_str)
+                        else:
+                            new_prompt = prompt
+                    else:
+                        new_prompt = prompt
+
+                elif operation.startswith("删除文本"):
+                    delete_text = getattr(self, 'delete_input', None)
+                    if delete_text and delete_text.text().strip():
+                        new_prompt = prompt.replace(delete_text.text(), "")
+                    else:
+                        new_prompt = prompt
+                else:
+                    new_prompt = prompt
+
+                preview_results.append(f"原文: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+                preview_results.append(f"修改: {new_prompt[:80]}{'...' if len(new_prompt) > 80 else ''}")
+                preview_results.append("─" * 50)
+
+            if len(self.selected_prompts) > 3:
+                preview_results.append(f"... 还有 {len(self.selected_prompts) - 3} 个提示词将使用相同规则处理")
+
+        except Exception as e:
+            preview_results = [f"预览生成错误: {str(e)}"]
+
+        self.preview_text.setPlainText('\n'.join(preview_results))
+
+    def get_processed_prompts(self):
+        """获取处理后的提示词列表"""
+        operation = self.operation_combo.currentText()
+        processed_prompts = []
+
+        for prompt in self.selected_prompts:
+            try:
+                if operation.startswith("添加前缀"):
+                    prefix = getattr(self, 'prefix_input', None)
+                    if prefix and prefix.text().strip():
+                        new_prompt = prefix.text().strip() + prompt
+                    else:
+                        new_prompt = prompt
+
+                elif operation.startswith("添加后缀"):
+                    suffix = getattr(self, 'suffix_input', None)
+                    if suffix and suffix.text().strip():
+                        new_prompt = prompt + suffix.text().strip()
+                    else:
+                        new_prompt = prompt
+
+                elif operation.startswith("查找替换"):
+                    find_text = getattr(self, 'find_input', None)
+                    replace_text = getattr(self, 'replace_input', None)
+                    if find_text and replace_text:
+                        find_str = find_text.text()
+                        replace_str = replace_text.text()
+                        if find_str:
+                            new_prompt = prompt.replace(find_str, replace_str)
+                        else:
+                            new_prompt = prompt
+                    else:
+                        new_prompt = prompt
+
+                elif operation.startswith("删除文本"):
+                    delete_text = getattr(self, 'delete_input', None)
+                    if delete_text and delete_text.text().strip():
+                        new_prompt = prompt.replace(delete_text.text(), "")
+                    else:
+                        new_prompt = prompt
+                else:
+                    new_prompt = prompt
+
+                processed_prompts.append(new_prompt)
+
+            except Exception as e:
+                # 如果处理失败，保持原样
+                processed_prompts.append(prompt)
+
+        return processed_prompts
+
+class HistoryDialog(QDialog):
+    """历史记录管理对话框"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📜 历史记录管理")
+        self.resize(800, 600)
+        self.setMinimumSize(700, 500)
+        self.setModal(True)
+
+        self.selected_history = None
+        self.setup_ui()
+        self.refresh_history_list()
+
+        # 设置样式
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f5f5f5;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #ddd;
+                border-radius: 8px;
+                margin-top: 1ex;
+                padding-top: 10px;
+                background-color: white;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+                color: #333;
+            }
+            QPushButton {
+                background-color: #1976d2;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #1565c0;
+            }
+            QPushButton:pressed {
+                background-color: #0d47a1;
+            }
+            QTableWidget {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: white;
+                gridline-color: #eee;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border: none;
+            }
+            QTableWidget::item:selected {
+                background-color: #e3f2fd;
+                color: #1976d2;
+            }
+        """)
+
+    def setup_ui(self):
+        """设置UI界面"""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # 标题
+        title_label = QLabel("📜 历史记录管理")
+        title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #333; margin-bottom: 10px;")
+        layout.addWidget(title_label)
+
+        # 操作按钮
+        button_layout = QHBoxLayout()
+
+        self.save_current_button = QPushButton("💾 保存当前会话")
+        self.save_current_button.clicked.connect(self.save_current_session)
+        button_layout.addWidget(self.save_current_button)
+
+        self.refresh_button = QPushButton("🔄 刷新列表")
+        self.refresh_button.clicked.connect(self.refresh_history_list)
+        button_layout.addWidget(self.refresh_button)
+
+        button_layout.addStretch()
+
+        self.load_button = QPushButton("📂 加载选中")
+        self.load_button.clicked.connect(self.load_selected_history)
+        self.load_button.setEnabled(False)
+        button_layout.addWidget(self.load_button)
+
+        self.delete_button = QPushButton("🗑️ 删除选中")
+        self.delete_button.clicked.connect(self.delete_selected_history)
+        self.delete_button.setEnabled(False)
+        button_layout.addWidget(self.delete_button)
+
+        layout.addLayout(button_layout)
+
+        # 历史记录表格
+        history_group = QGroupBox("📋 历史记录列表")
+        history_layout = QVBoxLayout(history_group)
+
+        self.history_table = QTableWidget()
+        self.history_table.setColumnCount(6)
+        self.history_table.setHorizontalHeaderLabels([
+            "文件名", "创建时间", "提示词数", "成功", "失败", "配置信息"
+        ])
+
+        # 设置表格属性
+        self.history_table.setAlternatingRowColors(True)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+        # 设置列宽
+        header = self.history_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)  # 文件名
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)  # 创建时间
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # 提示词数
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # 成功
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  # 失败
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)  # 配置信息
+
+        self.history_table.setColumnWidth(2, 80)
+        self.history_table.setColumnWidth(3, 60)
+        self.history_table.setColumnWidth(4, 60)
+
+        # 连接选择变化事件
+        self.history_table.selectionModel().selectionChanged.connect(self.on_selection_changed)
+        self.history_table.cellDoubleClicked.connect(self.load_selected_history)
+
+        history_layout.addWidget(self.history_table)
+        layout.addWidget(history_group)
+
+        # 底部按钮
+        bottom_layout = QHBoxLayout()
+        bottom_layout.addStretch()
+
+        self.close_button = QPushButton("❌ 关闭")
+        self.close_button.clicked.connect(self.reject)
+        bottom_layout.addWidget(self.close_button)
+
+        layout.addLayout(bottom_layout)
+
+    def refresh_history_list(self):
+        """刷新历史记录列表"""
+        history_files = get_history_files()
+
+        self.history_table.setRowCount(len(history_files))
+
+        for row, file_info in enumerate(history_files):
+            # 文件名
+            name_item = QTableWidgetItem(file_info['name'])
+            name_item.setData(Qt.ItemDataRole.UserRole, file_info['path'])
+            self.history_table.setItem(row, 0, name_item)
+
+            # 创建时间
+            created_item = QTableWidgetItem(file_info['created_time'])
+            self.history_table.setItem(row, 1, created_item)
+
+            # 提示词数
+            total_item = QTableWidgetItem(str(file_info['total_prompts']))
+            total_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.history_table.setItem(row, 2, total_item)
+
+            # 成功数
+            success_item = QTableWidgetItem(str(file_info['success_count']))
+            success_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            success_item.setBackground(QColor("#e8f5e8"))
+            self.history_table.setItem(row, 3, success_item)
+
+            # 失败数
+            failed_item = QTableWidgetItem(str(file_info['failed_count']))
+            failed_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if file_info['failed_count'] > 0:
+                failed_item.setBackground(QColor("#ffebee"))
+            self.history_table.setItem(row, 4, failed_item)
+
+            # 配置信息（从实际文件读取）
+            config_text = "配置信息不可用"
+            try:
+                history_data = load_history_record(file_info['path'])
+                if history_data and 'config' in history_data:
+                    config = history_data['config']
+                    config_text = f"{config.get('api_platform', '未知')} | {config.get('model_type', '未知')}"
+            except:
+                pass
+
+            config_item = QTableWidgetItem(config_text)
+            self.history_table.setItem(row, 5, config_item)
+
+    def on_selection_changed(self):
+        """选择变化时更新按钮状态"""
+        has_selection = bool(self.history_table.currentRow() >= 0)
+        self.load_button.setEnabled(has_selection)
+        self.delete_button.setEnabled(has_selection)
+
+    def save_current_session(self):
+        """保存当前会话"""
+        if not self.parent():
+            QMessageBox.warning(self, "错误", "无法获取当前会话数据")
+            return
+
+        parent = self.parent()
+
+        # 检查是否有数据需要保存
+        if not parent.prompt_table_data:
+            QMessageBox.warning(self, "提示", "当前会话没有提示词数据可以保存")
+            return
+
+        # 让用户输入文件名
+        filename, ok = QInputDialog.getText(
+            self,
+            "保存历史记录",
+            "请输入历史记录文件名:",
+            text=f"session_{time.strftime('%Y%m%d_%H%M%S')}"
+        )
+
+        if not ok or not filename.strip():
+            return
+
+        filename = filename.strip()
+
+        # 准备配置数据
+        config_data = {
+            'api_platform': parent.api_platform,
+            'model_type': parent.model_type,
+            'thread_count': parent.thread_count,
+            'retry_count': parent.retry_count,
+            'image_ratio': parent.image_ratio,
+            'current_style': parent.current_style,
+            'custom_style_content': parent.custom_style_content
+        }
+
+        # 保存历史记录
+        saved_path = save_history_record(parent.prompt_table_data, config_data, filename)
+
+        if saved_path:
+            QMessageBox.information(
+                self,
+                "保存成功",
+                f"历史记录已保存到:\n{saved_path}"
+            )
+            self.refresh_history_list()
+        else:
+            QMessageBox.critical(self, "保存失败", "保存历史记录时发生错误")
+
+    def load_selected_history(self):
+        """加载选中的历史记录"""
+        current_row = self.history_table.currentRow()
+        if current_row < 0:
+            QMessageBox.warning(self, "提示", "请先选择要加载的历史记录")
+            return
+
+        # 获取文件路径
+        name_item = self.history_table.item(current_row, 0)
+        if not name_item:
+            return
+
+        file_path = name_item.data(Qt.ItemDataRole.UserRole)
+
+        # 确认操作
+        reply = QMessageBox.question(
+            self,
+            "确认加载",
+            "加载历史记录将替换当前会话的所有数据。\n确定要继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # 加载历史记录
+        history_data = load_history_record(file_path)
+        if not history_data:
+            QMessageBox.critical(self, "加载失败", "无法读取历史记录文件")
+            return
+
+        self.selected_history = history_data
+        QMessageBox.information(self, "加载成功", "历史记录加载成功！\n关闭此对话框后将应用到主界面。")
+        self.accept()
+
+    def delete_selected_history(self):
+        """删除选中的历史记录"""
+        current_row = self.history_table.currentRow()
+        if current_row < 0:
+            QMessageBox.warning(self, "提示", "请先选择要删除的历史记录")
+            return
+
+        # 获取文件信息
+        name_item = self.history_table.item(current_row, 0)
+        if not name_item:
+            return
+
+        file_path = name_item.data(Qt.ItemDataRole.UserRole)
+        filename = name_item.text()
+
+        # 确认删除
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定要删除历史记录文件 '{filename}' 吗？\n此操作不可撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                import os
+                os.remove(file_path)
+                QMessageBox.information(self, "删除成功", f"历史记录 '{filename}' 已删除")
+                self.refresh_history_list()
+            except Exception as e:
+                QMessageBox.critical(self, "删除失败", f"删除文件时发生错误: {str(e)}")
+
+    def get_selected_history(self):
+        """获取选中的历史记录数据"""
+        return self.selected_history
+
+class SimpleImageViewerDialog(QDialog):
+    """简化的图片查看器对话框 - 只显示图片和关闭按钮"""
+
     def __init__(self, image_number, prompt_text, save_path, parent=None, actual_filename=None):
         super().__init__(parent)
         self.image_number = image_number
         self.prompt_text = prompt_text
         self.save_path = save_path
         self.actual_filename = actual_filename
-        self.setWindowTitle(f"图片预览 - {prompt_text[:30]}...")
+
+        self.setWindowTitle(f"图片查看器 - {image_number}")
         self.setModal(True)
         self.resize(800, 600)
-        
+        self.setMinimumSize(400, 300)
+
+        self.setup_ui()
+        self.load_image()
+
+    def setup_ui(self):
+        """设置UI界面"""
         layout = QVBoxLayout(self)
-        
-        # 图片显示区域
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        # 图片显示区域（带滚动条）
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scroll_area.setStyleSheet("QScrollArea { border: 1px solid #ddd; background-color: #f9f9f9; }")
+
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setStyleSheet("border: 1px solid #ddd; background-color: #f9f9f9;")
-        self.image_label.setText("正在加载图片...")
-        
-        layout.addWidget(self.image_label)
-        
-        # 底部信息和按钮
-        info_layout = QHBoxLayout()
-        
-        info_label = QLabel(f"提示词: {prompt_text}")
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #666; font-size: 12px;")
-        info_layout.addWidget(info_label)
-        
-        info_layout.addStretch()
-        
-        close_button = QPushButton("关闭")
-        close_button.clicked.connect(self.close)
-        info_layout.addWidget(close_button)
-        
-        layout.addLayout(info_layout)
-        
-        # 加载图片
-        self.load_image()
-    
+        self.image_label.setMinimumSize(300, 200)
+
+        scroll_area.setWidget(self.image_label)
+        layout.addWidget(scroll_area)
+
+        # 底部关闭按钮
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        close_btn = QPushButton("关闭")
+        close_btn.setMinimumWidth(100)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1976d2;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 6px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #1565c0;
+            }
+        """)
+        close_btn.clicked.connect(self.close)
+        button_layout.addWidget(close_btn)
+
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
     def load_image(self):
-        """从本地文件加载并显示图片"""
+        """加载图片"""
         try:
-            # 检查保存路径
             if not self.save_path:
                 self.image_label.setText("保存路径未设置")
                 return
-            
-            # 直接使用基础文件名
-            filename = f"{self.image_number}.png"
-            file_path = os.path.join(self.save_path, filename)
-            
-            # 检查文件是否存在
-            if not os.path.exists(file_path):
-                self.image_label.setText(f"本地图片文件不存在:\n{filename}")
-                return
-            
-            # 从本地文件加载图片
-            pixmap = QPixmap(file_path)
-            
-            if not pixmap.isNull():
-                # 缩放图片以适应窗口，保持比例
-                scaled_pixmap = pixmap.scaled(
-                    self.image_label.size() - QSize(20, 20),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
-                self.image_label.setPixmap(scaled_pixmap)
+
+            # 确定文件路径
+            if self.actual_filename:
+                filename = self.actual_filename
             else:
-                self.image_label.setText("图片文件格式错误")
-                
+                filename = f"{self.image_number}.png"
+
+            file_path = os.path.join(self.save_path, filename)
+
+            if not os.path.exists(file_path):
+                self.image_label.setText(f"图片文件不存在：\n{filename}")
+                return
+
+            # 加载图片
+            pixmap = QPixmap(file_path)
+
+            if not pixmap.isNull():
+                # 自适应窗口大小显示图片
+                self.fit_image_to_window(pixmap)
+            else:
+                self.image_label.setText("图片格式错误")
+
         except Exception as e:
-            self.image_label.setText(f"本地图片加载失败:\n{str(e)}")
-    
-    def find_actual_image_file(self, image_number, save_path):
-        """查找实际的图片文件名"""
-        import os
-        
-        # 只查找基础文件名
-        base_filename = f"{image_number}.png"
-        base_file_path = os.path.join(save_path, base_filename)
-        
-        # 检查基础文件名是否存在
-        if os.path.exists(base_file_path):
-            return base_filename
-        
-        return None
+            self.image_label.setText(f"加载图片失败：\n{str(e)}")
+
+    def fit_image_to_window(self, pixmap):
+        """将图片适配到窗口大小"""
+        # 获取可用显示区域大小（减去边距和按钮区域）
+        available_size = self.size() - QSize(40, 80)  # 考虑边距和底部按钮
+
+        # 计算缩放后的图片大小，保持纵横比
+        scaled_pixmap = pixmap.scaled(
+            available_size.width(),
+            available_size.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+
+        self.image_label.setPixmap(scaled_pixmap)
+        self.image_label.resize(scaled_pixmap.size())
+
+    def resizeEvent(self, event):
+        """窗口大小改变时重新适配图片"""
+        super().resizeEvent(event)
+        if hasattr(self, 'image_label') and self.image_label.pixmap():
+            # 重新加载图片以适配新的窗口大小
+            self.load_image()
+
+
+class ImageViewerDialog(QDialog):
+    """增强的图片查看器对话框"""
+
+    def __init__(self, image_number, prompt_text, save_path, parent=None, actual_filename=None, prompt_data=None):
+        super().__init__(parent)
+        self.image_number = image_number
+        self.prompt_text = prompt_text
+        self.save_path = save_path
+        self.actual_filename = actual_filename
+        self.prompt_data = prompt_data or {}
+        self.scale_factor = 1.0
+        self.original_pixmap = None
+
+        self.setWindowTitle(f"图片查看器 - {prompt_text[:30]}...")
+        self.setModal(True)
+        self.resize(1000, 700)
+        self.setMinimumSize(600, 400)
+
+        self.setup_ui()
+        self.load_image()
+
+    def setup_ui(self):
+        """设置UI界面"""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        # 顶部工具栏
+        toolbar_layout = QHBoxLayout()
+
+        # 缩放控制
+        zoom_in_btn = QPushButton("🔍 放大")
+        zoom_out_btn = QPushButton("🔍 缩小")
+        reset_zoom_btn = QPushButton("📐 原始大小")
+        fit_window_btn = QPushButton("📱 适应窗口")
+
+        zoom_in_btn.clicked.connect(self.zoom_in)
+        zoom_out_btn.clicked.connect(self.zoom_out)
+        reset_zoom_btn.clicked.connect(self.reset_zoom)
+        fit_window_btn.clicked.connect(self.fit_to_window)
+
+        toolbar_layout.addWidget(zoom_in_btn)
+        toolbar_layout.addWidget(zoom_out_btn)
+        toolbar_layout.addWidget(reset_zoom_btn)
+        toolbar_layout.addWidget(fit_window_btn)
+        toolbar_layout.addStretch()
+
+        # 保存按钮
+        save_as_btn = QPushButton("💾 另存为")
+        save_as_btn.clicked.connect(self.save_as)
+        toolbar_layout.addWidget(save_as_btn)
+
+        layout.addLayout(toolbar_layout)
+
+        # 图片显示区域（带滚动条）
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setStyleSheet("border: 1px solid #ddd; background-color: #f9f9f9;")
+        self.image_label.setMinimumSize(400, 300)
+
+        scroll_area.setWidget(self.image_label)
+        layout.addWidget(scroll_area)
+
+        # 底部信息面板
+        info_group = QGroupBox("图片信息")
+        info_layout = QVBoxLayout(info_group)
+
+        # 基本信息
+        basic_info = QHBoxLayout()
+        basic_info.addWidget(QLabel(f"编号: {self.image_number}"))
+        basic_info.addWidget(QLabel(f"模型: {self.prompt_data.get('model_type', '未知')}"))
+        basic_info.addWidget(QLabel(f"状态: {self.prompt_data.get('status', '未知')}"))
+        basic_info.addStretch()
+
+        # 缩放信息
+        self.zoom_label = QLabel("缩放: 100%")
+        basic_info.addWidget(self.zoom_label)
+
+        info_layout.addLayout(basic_info)
+
+        # 提示词信息
+        prompt_label = QLabel("提示词:")
+        prompt_label.setStyleSheet("font-weight: bold;")
+        info_layout.addWidget(prompt_label)
+
+        prompt_text_edit = QPlainTextEdit()
+        prompt_text_edit.setPlainText(self.prompt_text)
+        prompt_text_edit.setReadOnly(True)
+        prompt_text_edit.setMaximumHeight(80)
+        info_layout.addWidget(prompt_text_edit)
+
+        layout.addWidget(info_group)
+
+        # 底部按钮
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.close)
+        button_layout.addWidget(close_btn)
+
+        layout.addLayout(button_layout)
+
+    def load_image(self):
+        """加载图片"""
+        try:
+            if not self.save_path:
+                self.image_label.setText("保存路径未设置")
+                return
+
+            # 确定文件路径
+            if self.actual_filename:
+                filename = self.actual_filename
+            else:
+                filename = f"{self.image_number}.png"
+
+            file_path = os.path.join(self.save_path, filename)
+
+            if not os.path.exists(file_path):
+                self.image_label.setText(f"图片文件不存在:\n{filename}")
+                return
+
+            # 加载原始图片
+            self.original_pixmap = QPixmap(file_path)
+
+            if not self.original_pixmap.isNull():
+                self.fit_to_window()
+            else:
+                self.image_label.setText("图片格式错误")
+
+        except Exception as e:
+            self.image_label.setText(f"加载图片失败:\n{str(e)}")
+
+    def update_image_display(self):
+        """更新图片显示"""
+        if self.original_pixmap and not self.original_pixmap.isNull():
+            scaled_pixmap = self.original_pixmap.scaled(
+                int(self.original_pixmap.width() * self.scale_factor),
+                int(self.original_pixmap.height() * self.scale_factor),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.image_label.setPixmap(scaled_pixmap)
+            self.image_label.resize(scaled_pixmap.size())
+
+            # 更新缩放信息
+            self.zoom_label.setText(f"缩放: {int(self.scale_factor * 100)}%")
+
+    def zoom_in(self):
+        """放大"""
+        self.scale_factor *= 1.25
+        if self.scale_factor > 5.0:  # 最大放大5倍
+            self.scale_factor = 5.0
+        self.update_image_display()
+
+    def zoom_out(self):
+        """缩小"""
+        self.scale_factor /= 1.25
+        if self.scale_factor < 0.1:  # 最小缩小到10%
+            self.scale_factor = 0.1
+        self.update_image_display()
+
+    def reset_zoom(self):
+        """重置为原始大小"""
+        self.scale_factor = 1.0
+        self.update_image_display()
+
+    def fit_to_window(self):
+        """适应窗口大小"""
+        if self.original_pixmap and not self.original_pixmap.isNull():
+            # 计算适合窗口的缩放比例
+            available_size = self.image_label.parent().size() - QSize(40, 40)
+            scale_x = available_size.width() / self.original_pixmap.width()
+            scale_y = available_size.height() / self.original_pixmap.height()
+            self.scale_factor = min(scale_x, scale_y, 1.0)  # 不超过原始大小
+            self.update_image_display()
+
+    def save_as(self):
+        """另存为"""
+        if not self.original_pixmap or self.original_pixmap.isNull():
+            QMessageBox.warning(self, "提示", "没有可保存的图片")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存图片",
+            f"{self.image_number}_{self.prompt_text[:20]}.png",
+            "图片文件 (*.png *.jpg *.jpeg);;所有文件 (*)"
+        )
+
+        if file_path:
+            try:
+                self.original_pixmap.save(file_path)
+                QMessageBox.information(self, "成功", f"图片已保存到:\n{file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+
 
 class PromptTableDelegate(QStyledItemDelegate):
     """自定义表格委托，处理编辑和显示"""
@@ -2381,6 +3440,9 @@ class MainWindow(QMainWindow):
         
         # 确保图片目录存在
         ensure_images_directory()
+
+        # 确保历史记录目录存在
+        ensure_history_directory()
         
         # 为现有分类创建目录（兼容旧版本）
         for category_name in self.category_links.keys():
@@ -2535,6 +3597,20 @@ class MainWindow(QMainWindow):
         toolbar_layout.addStretch()
         
         # 右侧工具按钮
+        self.history_button = QPushButton("📜 历史记录")
+        self.history_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2e7d32;
+                font-size: 14px;
+                padding: 10px 20px;
+            }
+            QPushButton:hover {
+                background-color: #388e3c;
+            }
+        """)
+        self.history_button.clicked.connect(self.open_history)
+        toolbar_layout.addWidget(self.history_button)
+
         self.settings_button = QPushButton("⚙️ 设置中心")
         self.settings_button.setStyleSheet("""
             QPushButton {
@@ -2586,7 +3662,12 @@ class MainWindow(QMainWindow):
         self.export_prompts_button = QPushButton("📤 导出CSV")
         self.export_prompts_button.clicked.connect(self.export_prompts_to_csv)
         button_layout.addWidget(self.export_prompts_button)
-        
+
+        # 批量编辑按钮
+        self.batch_edit_button = QPushButton("📝 批量编辑")
+        self.batch_edit_button.clicked.connect(self.batch_edit_prompts)
+        button_layout.addWidget(self.batch_edit_button)
+
         button_layout.addStretch()
         
         # 风格选择
@@ -2614,6 +3695,32 @@ class MainWindow(QMainWindow):
         """)
         self.main_style_combo.currentTextChanged.connect(self.on_main_style_changed)
         style_layout.addWidget(self.main_style_combo)
+
+        # 模型选择
+        model_label = QLabel("🤖 模型:")
+        model_label.setStyleSheet("color: #666; font-weight: bold; margin-left: 20px;")
+        style_layout.addWidget(model_label)
+
+        self.main_model_combo = QComboBox()
+        self.main_model_combo.setMinimumWidth(150)
+        self.main_model_combo.addItems(["sora_image", "nano-banana"])
+        self.main_model_combo.setStyleSheet("""
+            QComboBox {
+                padding: 5px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background-color: white;
+            }
+            QComboBox:hover {
+                border-color: #2196f3;
+            }
+            QComboBox::drop-down {
+                border: none;
+                padding-right: 10px;
+            }
+        """)
+        self.main_model_combo.currentTextChanged.connect(self.on_main_model_changed)
+        style_layout.addWidget(self.main_model_combo)
         
         # 将风格选择添加到button_layout
         style_widget = QWidget()
@@ -2621,7 +3728,7 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(style_widget)
         
         # 使用提示
-        usage_hint = QLabel("💡 双击提示词可编辑")
+        usage_hint = QLabel("💡 双击提示词可编辑 | 📝 选择多行可批量编辑 (Ctrl+点击多选，Shift+点击连选)")
         usage_hint.setStyleSheet("color: #666; font-size: 12px; font-style: italic;")
         button_layout.addWidget(usage_hint)
         
@@ -2634,48 +3741,322 @@ class MainWindow(QMainWindow):
         
         # 提示词表格
         self.prompt_table = QTableWidget()
-        self.prompt_table.setColumnCount(4)
-        self.prompt_table.setHorizontalHeaderLabels(["编号", "提示词", "状态", "生成图片"])
-        
+        self.prompt_table.setColumnCount(5)  # 增加一列用于checkbox
+        self.prompt_table.setHorizontalHeaderLabels(["选择", "编号", "提示词", "状态", "生成图片"])
+
         # 设置表格属性
         self.prompt_table.setAlternatingRowColors(False)  # 禁用斑马纹，全部白色背景
         self.prompt_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         # 允许双击和F2键编辑
         self.prompt_table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed)
-        
+
         # 设置表格图标尺寸（重要：这决定了缩略图在表格中的显示大小）
         self.prompt_table.setIconSize(QSize(180, 180))
-        
+
         # 设置列宽
         header = self.prompt_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)  # 编号列固定宽度
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # 提示词列自适应
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # 状态列固定宽度
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # 图片列固定宽度
-        
-        self.prompt_table.setColumnWidth(0, 80)   # 编号列
-        self.prompt_table.setColumnWidth(2, 120)  # 状态列
-        self.prompt_table.setColumnWidth(3, 220)  # 图片列（增加宽度以容纳180px缩略图）
-        
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)  # 选择列固定宽度
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)  # 编号列固定宽度
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)  # 提示词列自适应
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # 状态列固定宽度
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  # 图片列固定宽度
+
+        self.prompt_table.setColumnWidth(0, 50)   # 选择列
+        self.prompt_table.setColumnWidth(1, 80)   # 编号列
+        self.prompt_table.setColumnWidth(3, 120)  # 状态列
+        self.prompt_table.setColumnWidth(4, 220)  # 图片列（增加宽度以容纳180px缩略图）
+
         # 设置行高自适应内容
         self.prompt_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.prompt_table.verticalHeader().setMinimumSectionSize(200)  # 设置足够的行高以完整显示180px缩略图
-        
+
         # 隐藏行号，避免与编号列混淆
         self.prompt_table.verticalHeader().setVisible(False)
-        
+
         # 设置文本换行
         self.prompt_table.setWordWrap(True)
-        
+
         # 设置自定义委托
         self.table_delegate = PromptTableDelegate()
         self.prompt_table.setItemDelegate(self.table_delegate)
-        
+
         # 连接信号
         self.prompt_table.cellChanged.connect(self.on_table_cell_changed)
         self.prompt_table.cellDoubleClicked.connect(self.on_table_cell_double_clicked)
-        
-        layout.addWidget(self.prompt_table)
+        self.prompt_table.cellClicked.connect(self.on_table_cell_clicked)  # 添加单击事件
+
+        # 创建表格容器布局
+        table_container = QVBoxLayout()
+
+        # 创建自定义表头（包含checkbox）
+        self.create_custom_table_header()
+        table_container.addWidget(self.custom_header_widget)
+
+        # 隐藏原始表头，使用我们的自定义表头
+        self.prompt_table.horizontalHeader().hide()
+
+        table_container.addWidget(self.prompt_table)
+
+        # 将表格容器添加到主布局
+        table_widget = QWidget()
+        table_widget.setLayout(table_container)
+        layout.addWidget(table_widget)
+
+    def on_table_cell_clicked(self, row, column):
+        """表格单元格点击事件 - 实现点击行选中功能"""
+        # 如果点击的不是checkbox列（第0列），则切换该行的checkbox状态
+        if column != 0:
+            checkbox_widget = self.prompt_table.cellWidget(row, 0)
+            if checkbox_widget:
+                checkbox = checkbox_widget.findChild(RowCheckBox)
+                if not checkbox:
+                    checkbox = checkbox_widget.findChild(QCheckBox)
+
+                if checkbox:
+                    # 切换checkbox状态
+                    checkbox.setChecked(not checkbox.isChecked())
+
+    def create_custom_table_header(self):
+        """创建自定义表头，包含checkbox"""
+        self.custom_header_widget = QWidget()
+        self.custom_header_widget.setFixedHeight(30)
+        self.custom_header_widget.setStyleSheet("""
+            QWidget {
+                background-color: #f5f5f5;
+                border-bottom: 1px solid #ddd;
+            }
+        """)
+
+        header_layout = QHBoxLayout(self.custom_header_widget)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(0)
+
+        # 创建各列的表头
+        # 选择列 - 包含checkbox和文字（水平排列）
+        select_widget = QWidget()
+        select_widget.setFixedWidth(50)
+        select_layout = QHBoxLayout(select_widget)  # 改为水平布局
+        select_layout.setContentsMargins(5, 5, 5, 5)
+        select_layout.setSpacing(3)
+
+        # 全选checkbox
+        self.header_checkbox = QCheckBox()
+        self.header_checkbox.setToolTip("全选/取消全选")
+        self.header_checkbox.stateChanged.connect(self.on_header_checkbox_changed)
+        select_layout.addWidget(self.header_checkbox)
+
+        # "选择"文字标签
+        select_label = QLabel("选择")
+        select_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        select_label.setStyleSheet("font-size: 10px; color: #666; font-weight: bold;")
+        select_layout.addWidget(select_label)
+
+        header_layout.addWidget(select_widget)
+
+        # 其他列的表头标签
+        headers = ["编号", "提示词", "状态", "生成图片"]
+        widths = [80, None, 120, 220]  # None表示自适应
+
+        for i, (header_text, width) in enumerate(zip(headers, widths)):
+            label = QLabel(header_text)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setStyleSheet("font-weight: bold; color: #333; padding: 5px;")
+
+            if width:
+                label.setFixedWidth(width)
+            else:
+                label.setMinimumWidth(100)
+
+            header_layout.addWidget(label)
+
+            # 如果是提示词列，让它自适应剩余空间
+            if i == 1:  # 提示词列
+                header_layout.setStretchFactor(label, 1)
+
+    def on_header_checkbox_changed(self, state):
+        """表头checkbox状态改变"""
+        try:
+            # 修复状态判断逻辑 - 使用整数值进行比较
+            is_checked = state == 2 or state == Qt.CheckState.Checked
+
+            # 避免递归调用
+            if hasattr(self, '_updating_checkboxes') and self._updating_checkboxes:
+                return
+
+            self._updating_checkboxes = True
+
+            # 更新所有行的checkbox状态
+            for row in range(self.prompt_table.rowCount()):
+                checkbox_widget = self.prompt_table.cellWidget(row, 0)
+
+                if checkbox_widget:
+                    # 查找RowCheckBox widget，如果找不到就找QCheckBox
+                    checkbox = checkbox_widget.findChild(RowCheckBox)
+                    if not checkbox:
+                        checkbox = checkbox_widget.findChild(QCheckBox)
+
+
+                    if checkbox:
+                        # 临时断开信号连接，避免触发行checkbox的stateChanged
+                        checkbox.blockSignals(True)
+                        checkbox.setChecked(is_checked)
+                        checkbox.blockSignals(False)
+
+            self._updating_checkboxes = False
+
+            # 更新按钮状态
+            self.update_selection_buttons()
+        except Exception as e:
+            # 重置状态，防止卡死
+            self._updating_checkboxes = False
+            print(f"表头checkbox状态改变异常: {str(e)}")
+            # 不显示错误对话框，避免频繁弹窗
+
+    def create_generation_card(self, parent_layout):
+        """创建生成控制卡片"""
+        generation_card = QGroupBox("🚀 生成控制")
+        parent_layout.addWidget(generation_card)
+
+        layout = QVBoxLayout(generation_card)
+
+        # 生成按钮和进度信息
+        control_layout = QHBoxLayout()
+
+        # 智能生成按钮
+        self.generate_button = QPushButton("🚀 智能生成(仅新增)")
+        self.generate_button.setMinimumHeight(50)
+        self.generate_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4caf50;
+                font-size: 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        self.generate_button.clicked.connect(self.start_generation)
+        control_layout.addWidget(self.generate_button)
+
+        # 重新生成选中按钮
+        self.regenerate_selected_button = QPushButton("🔄 重新生成选中")
+        self.regenerate_selected_button.setMinimumHeight(50)
+        self.regenerate_selected_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2196f3;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1976d2;
+            }
+        """)
+        self.regenerate_selected_button.clicked.connect(self.start_regenerate_selected)
+        control_layout.addWidget(self.regenerate_selected_button)
+
+        # 重新生成全部按钮
+        self.regenerate_all_button = QPushButton("🔄 重新生成全部")
+        self.regenerate_all_button.setMinimumHeight(50)
+        self.regenerate_all_button.setStyleSheet("""
+            QPushButton {
+                background-color: #ff9800;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #f57c00;
+            }
+        """)
+        self.regenerate_all_button.clicked.connect(self.start_regenerate_all)
+        control_layout.addWidget(self.regenerate_all_button)
+
+        # 进度信息
+        progress_layout = QVBoxLayout()
+
+        self.overall_progress_label = QLabel("等待开始...")
+        self.overall_progress_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        progress_layout.addWidget(self.overall_progress_label)
+
+        self.overall_progress_bar = QProgressBar()
+        self.overall_progress_bar.setVisible(False)
+        progress_layout.addWidget(self.overall_progress_bar)
+
+        control_layout.addLayout(progress_layout)
+
+        layout.addLayout(control_layout)
+
+    def on_row_checkbox_changed(self, row, checked):
+        """行checkbox状态改变"""
+        try:
+            if hasattr(self, '_updating_checkboxes') and self._updating_checkboxes:
+                return
+
+            # 检查是否所有checkbox都被选中
+            all_checked = True
+            any_checked = False
+
+            for r in range(self.prompt_table.rowCount()):
+                checkbox_widget = self.prompt_table.cellWidget(r, 0)
+                if checkbox_widget:
+                    checkbox = checkbox_widget.findChild(RowCheckBox)
+                    if not checkbox:
+                        checkbox = checkbox_widget.findChild(QCheckBox)
+
+                    if checkbox:
+                        if checkbox.isChecked():
+                            any_checked = True
+                        else:
+                            all_checked = False
+
+            # 更新表头checkbox状态
+            if hasattr(self, 'header_checkbox'):
+                self._updating_checkboxes = True
+                if all_checked and self.prompt_table.rowCount() > 0:
+                    self.header_checkbox.setCheckState(Qt.CheckState.Checked)
+                elif any_checked:
+                    self.header_checkbox.setCheckState(Qt.CheckState.PartiallyChecked)
+                else:
+                    self.header_checkbox.setCheckState(Qt.CheckState.Unchecked)
+                self._updating_checkboxes = False
+
+            # 更新按钮状态
+            self.update_selection_buttons()
+        except Exception as e:
+            # 重置状态，防止卡死
+            self._updating_checkboxes = False
+            print(f"行checkbox状态改变异常: {str(e)}")
+
+    def update_selection_buttons(self):
+        """更新选择相关按钮的状态"""
+        has_selection = len(self.get_selected_rows()) > 0
+
+        # 更新选择相关按钮
+        if hasattr(self, 'batch_edit_button'):
+            self.batch_edit_button.setEnabled(has_selection)
+        if hasattr(self, 'delete_prompt_button'):
+            self.delete_prompt_button.setEnabled(has_selection)
+        if hasattr(self, 'regenerate_selected_button'):
+            self.regenerate_selected_button.setEnabled(has_selection)
+
+    def get_selected_rows(self):
+        """获取选中的行"""
+        selected_rows = []
+
+        for row in range(self.prompt_table.rowCount()):
+            checkbox_widget = self.prompt_table.cellWidget(row, 0)
+
+            if checkbox_widget:
+                # 先尝试找RowCheckBox，如果找不到再找QCheckBox
+                checkbox = checkbox_widget.findChild(RowCheckBox)
+                if not checkbox:
+                    checkbox = checkbox_widget.findChild(QCheckBox)
+
+                if checkbox:
+                    is_checked = checkbox.isChecked()
+                    if is_checked:
+                        selected_rows.append(row)
+
+        return selected_rows
     
     def create_generation_card(self, parent_layout):
         """创建生成控制卡片"""
@@ -2754,7 +4135,76 @@ class MainWindow(QMainWindow):
         """打开设置中心"""
         dialog = SettingsDialog(self)
         dialog.exec()
-    
+
+    def open_history(self):
+        """打开历史记录管理"""
+        dialog = HistoryDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # 用户选择了加载历史记录
+            history_data = dialog.get_selected_history()
+            if history_data:
+                self.load_history_data(history_data)
+
+    def load_history_data(self, history_data):
+        """加载历史记录数据到当前会话"""
+        try:
+            # 加载提示词数据
+            if 'prompts' in history_data:
+                self.prompt_table_data = history_data['prompts']
+
+                # 重建提示词编号映射
+                self.prompt_numbers.clear()
+                for data in self.prompt_table_data:
+                    if 'prompt' in data and 'number' in data:
+                        self.prompt_numbers[data['prompt']] = data['number']
+
+            # 加载配置数据（直接应用，不询问用户）
+            if 'config' in history_data:
+                config = history_data['config']
+
+                # 直接应用配置（但不覆盖密钥）
+                if 'model_type' in config:
+                    self.model_type = config['model_type']
+                if 'thread_count' in config:
+                    self.thread_count = config['thread_count']
+                if 'retry_count' in config:
+                    self.retry_count = config['retry_count']
+                if 'image_ratio' in config:
+                    self.image_ratio = config['image_ratio']
+                if 'current_style' in config:
+                    self.current_style = config['current_style']
+                if 'custom_style_content' in config:
+                    self.custom_style_content = config['custom_style_content']
+
+                logging.info(f"已自动应用历史配置: 模型={config.get('model_type', '未知')}, 比例={config.get('image_ratio', '未知')}")
+
+            # 刷新界面
+            self.refresh_prompt_table()
+            self.update_prompt_stats()
+            self.refresh_ui_after_settings()
+
+            # 保存当前配置
+            self.save_config()
+
+            # 显示加载成功信息
+            total_prompts = len(self.prompt_table_data)
+            success_count = len([p for p in self.prompt_table_data if p.get('status') == '成功'])
+            failed_count = len([p for p in self.prompt_table_data if p.get('status') == '失败'])
+
+            QMessageBox.information(
+                self,
+                "历史记录加载完成",
+                f"已成功加载历史记录！\n\n"
+                f"提示词总数: {total_prompts}\n"
+                f"成功: {success_count}\n"
+                f"失败: {failed_count}\n"
+                f"创建时间: {history_data.get('created_time', '未知')}"
+            )
+
+        except Exception as e:
+            logging.error(f"加载历史数据失败: {e}")
+            QMessageBox.critical(self, "加载失败", f"加载历史数据时发生错误: {str(e)}")
+
     def refresh_ui_after_settings(self):
         """设置应用后刷新界面"""
         # 更新快捷状态显示
@@ -2770,6 +4220,10 @@ class MainWindow(QMainWindow):
         # 刷新主界面的风格选择下拉框
         if hasattr(self, 'main_style_combo'):
             self.refresh_main_style_combo()
+
+        # 刷新主界面的模型选择下拉框
+        if hasattr(self, 'main_model_combo'):
+            self.main_model_combo.setCurrentText(self.model_type)
             
         # 如果当前密钥存在，自动应用密钥
         if self.current_key_name and self.current_key_name in self.key_library:
@@ -3021,6 +4475,12 @@ class MainWindow(QMainWindow):
         
         # 保存配置
         self.save_config()
+
+    def on_main_model_changed(self, model_type):
+        """主界面模型选择变化处理"""
+        self.model_type = model_type
+        # 保存配置
+        self.save_config()
     
     def update_prompt_stats(self):
         """更新提示词统计"""
@@ -3030,39 +4490,83 @@ class MainWindow(QMainWindow):
 
     def refresh_prompt_table(self):
         """刷新提示词表格显示"""
-        self.prompt_table.setRowCount(len(self.prompt_table_data))
-        
-        for row, data in enumerate(self.prompt_table_data):
-            # 编号列
-            number_item = QTableWidgetItem(data['number'])
-            self.prompt_table.setItem(row, 0, number_item)
-            
-            # 提示词列
-            prompt_item = QTableWidgetItem(data['prompt'])
-            prompt_item.setToolTip("双击此处编辑提示词")  # 提示用户双击编辑
-            # 设置为不可编辑，只能通过双击对话框编辑
-            prompt_item.setFlags(prompt_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            # 设置文本对齐方式，支持换行
-            prompt_item.setTextAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-            self.prompt_table.setItem(row, 1, prompt_item)
-            
-            # 调整行高以适应内容
-            self.prompt_table.resizeRowToContents(row)
-            
-            # 状态列
-            status_item = QTableWidgetItem(data['status'])
-            status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)  # 不可编辑
-            self.update_status_style(status_item, data['status'])
-            self.prompt_table.setItem(row, 2, status_item)
-            
-            # 图片列
-            image_item = QTableWidgetItem()
-            image_item.setFlags(image_item.flags() & ~Qt.ItemFlag.ItemIsEditable)  # 不可编辑
-            # 设置图片居中对齐
-            image_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.prompt_table.setItem(row, 3, image_item)
-            # 在设置表格项后再更新图片显示，避免覆盖
-            self.update_image_display(row, data)
+        try:
+            # 清除现有的表格内容和widget
+            self.prompt_table.clearContents()
+            self.prompt_table.setRowCount(len(self.prompt_table_data))
+
+            for row, data in enumerate(self.prompt_table_data):
+                # 选择列 - 创建checkbox
+                checkbox_item = QTableWidgetItem()
+                checkbox_item.setFlags(checkbox_item.flags() & ~Qt.ItemFlag.ItemIsEditable)  # 不可编辑
+
+                # 创建checkbox widget
+                checkbox_widget = QWidget()
+                checkbox_layout = QHBoxLayout(checkbox_widget)
+                checkbox_layout.setContentsMargins(0, 0, 0, 0)
+
+                # 使用新的RowCheckBox类，避免lambda闭包问题
+                checkbox = RowCheckBox(row)
+                checkbox.setStyleSheet("QCheckBox::indicator { width: 18px; height: 18px; }")
+
+                # 连接信号到新的处理方法
+                checkbox.row_state_changed.connect(self.on_row_checkbox_changed)
+
+                # 将checkbox居中
+                checkbox_layout.addStretch()
+                checkbox_layout.addWidget(checkbox)
+                checkbox_layout.addStretch()
+
+                self.prompt_table.setItem(row, 0, checkbox_item)
+                self.prompt_table.setCellWidget(row, 0, checkbox_widget)
+
+                # 编号列
+                number_item = QTableWidgetItem(data['number'])
+                self.prompt_table.setItem(row, 1, number_item)
+
+                # 提示词列
+                prompt_item = QTableWidgetItem(data['prompt'])
+                prompt_item.setToolTip("双击此处编辑提示词")  # 提示用户双击编辑
+                # 设置为不可编辑，只能通过双击对话框编辑
+                prompt_item.setFlags(prompt_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                # 设置文本对齐方式，支持换行
+                prompt_item.setTextAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+                self.prompt_table.setItem(row, 2, prompt_item)
+
+                # 调整行高以适应内容
+                self.prompt_table.resizeRowToContents(row)
+
+                # 状态列
+                status_item = QTableWidgetItem(data['status'])
+                status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)  # 不可编辑
+                self.update_status_style(status_item, data['status'])
+                self.prompt_table.setItem(row, 3, status_item)
+
+                # 图片列
+                image_item = QTableWidgetItem()
+                image_item.setFlags(image_item.flags() & ~Qt.ItemFlag.ItemIsEditable)  # 不可编辑
+                # 设置图片居中对齐
+                image_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.prompt_table.setItem(row, 4, image_item)
+                # 在设置表格项后再更新图片显示，避免覆盖
+                self.update_image_display(row, data)
+
+            # 重置表头checkbox状态
+            if hasattr(self, 'header_checkbox'):
+                self.header_checkbox.setCheckState(Qt.CheckState.Unchecked)
+
+            # 更新按钮状态
+            self.update_selection_buttons()
+        except Exception as e:
+            print(f"刷新提示词表格异常: {str(e)}")
+            # 尝试重置表格状态
+            try:
+                self.prompt_table.setRowCount(0)
+                if hasattr(self, 'header_checkbox'):
+                    self.header_checkbox.setCheckState(Qt.CheckState.Unchecked)
+            except:
+                pass
+
     
     def update_status_style(self, item, status):
         """更新状态列样式"""
@@ -3081,7 +4585,7 @@ class MainWindow(QMainWindow):
     
     def update_image_display(self, row, data):
         """更新图片显示"""
-        item = self.prompt_table.item(row, 3)
+        item = self.prompt_table.item(row, 4)
         if not item:
             return
             
@@ -3114,7 +4618,7 @@ class MainWindow(QMainWindow):
     
     def load_and_set_thumbnail(self, row, image_number):
         """从本地文件加载并设置缩略图"""
-        item = self.prompt_table.item(row, 3)
+        item = self.prompt_table.item(row, 4)
         if not item:
             return
             
@@ -3212,7 +4716,7 @@ class MainWindow(QMainWindow):
         """延迟编辑新添加的提示词项"""
         try:
             if 0 <= row < self.prompt_table.rowCount():
-                item = self.prompt_table.item(row, 1)  # 提示词列
+                item = self.prompt_table.item(row, 2)  # 提示词列
                 if item:
                     self.prompt_table.editItem(item)
         except Exception as e:
@@ -3221,14 +4725,12 @@ class MainWindow(QMainWindow):
     
     def delete_selected_prompts(self):
         """删除选中的提示词"""
-        selected_rows = set()
-        for item in self.prompt_table.selectedItems():
-            selected_rows.add(item.row())
-        
+        selected_rows = self.get_selected_rows()
+
         if not selected_rows:
             QMessageBox.warning(self, "提示", "请先选择要删除的提示词")
             return
-        
+
         reply = QMessageBox.question(
             self,
             "确认删除",
@@ -3236,46 +4738,105 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
-        
+
         if reply == QMessageBox.StandardButton.Yes:
             # 从大到小删除，避免索引变化
             for row in sorted(selected_rows, reverse=True):
                 if 0 <= row < len(self.prompt_table_data):
                     del self.prompt_table_data[row]
-            
+
             self.refresh_prompt_table()
             self.update_prompt_stats()
-    
+
+    def toggle_select_all(self):
+        """切换全选/取消全选 - 这个方法可以移除，因为现在使用表头checkbox"""
+        pass
+
+    def batch_edit_prompts(self):
+        """批量编辑提示词"""
+        # 获取选中的行
+        selected_rows = self.get_selected_rows()
+
+        if not selected_rows:
+            QMessageBox.warning(self, "提示", "请先选择要批量编辑的提示词")
+            return
+
+        # 获取选中的提示词内容
+        selected_prompts = []
+        selected_indices = []
+        for row in sorted(selected_rows):
+            if 0 <= row < len(self.prompt_table_data):
+                selected_prompts.append(self.prompt_table_data[row]['prompt'])
+                selected_indices.append(row)
+
+        if not selected_prompts:
+            QMessageBox.warning(self, "错误", "未找到有效的提示词数据")
+            return
+
+        # 打开批量编辑对话框
+        dialog = BatchEditDialog(selected_prompts, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # 用户确认编辑，获取处理后的提示词
+            processed_prompts = dialog.get_processed_prompts()
+
+            if len(processed_prompts) != len(selected_indices):
+                QMessageBox.critical(self, "错误", "处理后的提示词数量不匹配")
+                return
+
+            # 应用修改
+            changes_made = 0
+            for i, row in enumerate(selected_indices):
+                old_prompt = self.prompt_table_data[row]['prompt']
+                new_prompt = processed_prompts[i]
+
+                if old_prompt != new_prompt:
+                    # 更新内部数据
+                    self.prompt_table_data[row]['prompt'] = new_prompt
+
+                    # 更新提示词编号映射
+                    if old_prompt in self.prompt_numbers:
+                        number = self.prompt_numbers.pop(old_prompt)
+                        self.prompt_numbers[new_prompt] = number
+
+                    changes_made += 1
+
+            # 刷新表格显示
+            if changes_made > 0:
+                self.refresh_prompt_table()
+                QMessageBox.information(self, "完成", f"已成功修改 {changes_made} 个提示词")
+            else:
+                QMessageBox.information(self, "提示", "没有提示词需要修改")
+
     def on_table_cell_changed(self, row, column):
         """表格单元格内容改变"""
         if 0 <= row < len(self.prompt_table_data):
             item = self.prompt_table.item(row, column)
             if item:
-                if column == 0:  # 编号列
+                if column == 1:  # 编号列（调整后的索引）
                     self.prompt_table_data[row]['number'] = item.text().strip()
-                elif column == 1:  # 提示词列
+                elif column == 2:  # 提示词列（调整后的索引）
                     old_prompt = self.prompt_table_data[row]['prompt']
                     new_prompt = item.text().strip()
                     self.prompt_table_data[row]['prompt'] = new_prompt
-                    
+
                     # 更新提示词编号映射
                     if old_prompt in self.prompt_numbers:
                         number = self.prompt_numbers.pop(old_prompt)
                         self.prompt_numbers[new_prompt] = number
-                    
+
                     # 设置工具提示显示完整内容
                     item.setToolTip(new_prompt)
-                    
+
                     # 调整行高以适应新内容
                     self.prompt_table.resizeRowToContents(row)
-                    
+
                     # 如果文本很长，确保表格能正确显示
                     if len(new_prompt) > 100:  # 长文本时强制刷新
                         self.prompt_table.viewport().update()
-    
+
     def on_table_cell_double_clicked(self, row, column):
         """表格单元格双击"""
-        if column == 1:  # 提示词列
+        if column == 2:  # 提示词列（调整后的索引）
             if 0 <= row < len(self.prompt_table_data):
                 data = self.prompt_table_data[row]
                 # 打开提示词编辑对话框
@@ -3287,20 +4848,21 @@ class MainWindow(QMainWindow):
                         # 更新内部数据
                         old_prompt = data['prompt']
                         data['prompt'] = new_text
-                        
+
                         # 更新提示词编号映射
                         if old_prompt in self.prompt_numbers:
                             number = self.prompt_numbers.pop(old_prompt)
                             self.prompt_numbers[new_text] = number
-                        
+
                         # 刷新表格显示
                         self.refresh_prompt_table()
-        elif column == 3:  # 图片列
+        elif column == 4:  # 图片列（调整后的索引）
             if 0 <= row < len(self.prompt_table_data):
                 data = self.prompt_table_data[row]
                 if data['status'] == '成功':
-                    # 打开图片查看对话框（从本地文件加载）
-                    dialog = ImageViewDialog(data['number'], data['prompt'], self.save_path, self)
+                    # 打开简化的图片查看对话框
+                    actual_filename = data.get('actual_filename')
+                    dialog = SimpleImageViewerDialog(data['number'], data['prompt'], self.save_path, self, actual_filename)
                     dialog.exec()
     
     def get_image_data_map(self):
@@ -3439,130 +5001,147 @@ class MainWindow(QMainWindow):
     
     def start_regenerate_selected(self):
         """重新生成选中的提示词"""
-        # 获取选中的行
-        selected_rows = set()
-        for item in self.prompt_table.selectedItems():
-            selected_rows.add(item.row())
-        
-        if not selected_rows:
-            QMessageBox.warning(self, "提示", "请先选择要重新生成的提示词")
-            return
-        
-        # 确认操作
-        selected_count = len(selected_rows)
-        reply = QMessageBox.question(
-            self, 
-            "确认重新生成", 
-            f"确定要重新生成选中的 {selected_count} 个提示词吗？\n\n这将重置选中提示词的状态并重新开始生成。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes
-        )
-        
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        
-        # 检查配置
-        if not self.api_key:
-            QMessageBox.warning(self, "配置不完整", "请先在设置中心配置API密钥")
-            return
-        
-        if not self.save_path:
-            QMessageBox.warning(self, "配置不完整", "请先在设置中心设置保存路径")
-            return
-        
-        self.save_config()
-        
-        # 获取选中的提示词数据
-        selected_prompts = []
-        selected_original_prompts = []
-        
-        # 按行号排序，确保顺序一致
-        for row in sorted(selected_rows):
-            if row < len(self.prompt_table_data):
-                data = self.prompt_table_data[row]
-                selected_prompts.append(data['prompt'])
-                selected_original_prompts.append(data['prompt'])
-                
-                # 重置选中提示词的状态
-                data['status'] = '等待中'
-                data['image_url'] = ''
-                data['error_msg'] = ''
-        
-        if not selected_prompts:
-            QMessageBox.warning(self, "错误", "没有找到有效的提示词数据")
-            return
-        
-        # 刷新表格显示
-        self.refresh_prompt_table()
-        
-        # 添加风格提示词和图片比例
-        style_content = ""
-        if self.custom_style_content.strip():
-            style_content = self.custom_style_content.strip()
-            if self.current_style and self.current_style in self.style_library:
+        try:
+
+            # 获取通过checkbox选中的行
+            selected_rows = self.get_selected_rows()
+
+            if not selected_rows:
+                QMessageBox.warning(self, "提示", "请先选择要重新生成的提示词")
+                return
+
+            # 确认操作
+            selected_count = len(selected_rows)
+            reply = QMessageBox.question(
+                self,
+                "确认重新生成",
+                f"确定要重新生成选中的 {selected_count} 个提示词吗？\n\n这将重置选中提示词的状态并重新开始生成。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            # 检查配置
+            if not hasattr(self, 'api_key') or not self.api_key:
+                QMessageBox.warning(self, "配置不完整", "请先在设置中心配置API密钥")
+                return
+
+            if not hasattr(self, 'save_path') or not self.save_path:
+                QMessageBox.warning(self, "配置不完整", "请先在设置中心设置保存路径")
+                return
+
+            self.save_config()
+
+            # 获取选中的提示词数据
+            selected_prompts = []
+            selected_original_prompts = []
+
+            # 按行号排序，确保顺序一致
+            for row in sorted(selected_rows):
+                if row < len(self.prompt_table_data):
+                    data = self.prompt_table_data[row]
+                    selected_prompts.append(data['prompt'])
+                    selected_original_prompts.append(data['prompt'])
+
+                    # 重置选中提示词的状态
+                    data['status'] = '等待中'
+                    data['image_url'] = ''
+                    data['error_msg'] = ''
+
+            if not selected_prompts:
+                QMessageBox.warning(self, "错误", "没有找到有效的提示词数据")
+                return
+
+            # 刷新表格显示
+            self.refresh_prompt_table()
+
+            # 添加风格提示词和图片比例
+            style_content = ""
+            if hasattr(self, 'custom_style_content') and self.custom_style_content.strip():
+                style_content = self.custom_style_content.strip()
+                if hasattr(self, 'current_style') and self.current_style and hasattr(self, 'style_library') and self.current_style in self.style_library:
+                    self.style_library[self.current_style]['usage_count'] = self.style_library[self.current_style].get('usage_count', 0) + 1
+            elif hasattr(self, 'current_style') and self.current_style and hasattr(self, 'style_library') and self.current_style in self.style_library:
+                style_content = self.style_library[self.current_style]['content'].strip()
                 self.style_library[self.current_style]['usage_count'] = self.style_library[self.current_style].get('usage_count', 0) + 1
-        elif self.current_style and self.current_style in self.style_library:
-            style_content = self.style_library[self.current_style]['content'].strip()
-            self.style_library[self.current_style]['usage_count'] = self.style_library[self.current_style].get('usage_count', 0) + 1
-        
-        ratio = self.image_ratio
-        
-        # 处理每个提示词
-        processed_prompts = []
-        for p in selected_prompts:
-            if f"图片比例【{ratio}】" not in p:
-                if style_content and style_content not in p:
-                    p = f"{p} {style_content}"
-                p = f"{p} 图片比例【{ratio}】"
-            processed_prompts.append(p)
-        
-        selected_prompts = processed_prompts
-        
-        # 设置计数器
-        self.total_images = len(selected_prompts)
-        self.completed_images = 0
-        
-        # 记录开始时间（用于性能统计）
-        self.generation_start_time = time.time()
-        
-        # 显示整体进度
-        self.overall_progress_bar.setVisible(True)
-        self.overall_progress_label.setText(f"🔄 重新生成选中的 {len(selected_prompts)} 张图片...")
-        
-        # 更新进度显示
-        self.update_generation_progress()
-        
-        # 更新按钮状态
-        self.regenerate_selected_button.setText("🔄 生成中...")
-        self.regenerate_selected_button.setEnabled(False)
-        
-        # 记录异步性能信息
-        logging.info(f"=== 重新生成选中项开始 ===")
-        logging.info(f"并发任务数: {self.max_concurrent_tasks}")
-        logging.info(f"选中图片数: {len(selected_prompts)}")
-        logging.info(f"预计性能提升: {min(len(selected_prompts), self.max_concurrent_tasks)}x")
-        
-        # 获取图片数据映射
-        image_data_map = self.get_image_data_map()
-        
-        # 为每个选中的提示词创建异步任务
-        for i, prompt in enumerate(selected_prompts):
-            # 从提示词中提取图片名称
-            image_names = self.extract_image_names(prompt)
-            
-            # 获取对应的图片数据
-            image_data_list = []
-            for name in image_names:
-                if name in image_data_map:
-                    image_data_list.append(image_data_map[name])
-            
-            # 获取对应的编号
-            original_prompt = selected_original_prompts[i]
-            number = self.prompt_numbers.get(original_prompt, str(sorted(selected_rows)[i] + 1))
-            
-            # 创建异步任务
-            self.run_async_worker(prompt, image_data_list, number, sorted(selected_rows)[i], original_prompt)
-    
+
+            ratio = getattr(self, 'image_ratio', '1:1')
+
+            # 处理每个提示词
+            processed_prompts = []
+            for p in selected_prompts:
+                if f"图片比例【{ratio}】" not in p:
+                    if style_content and style_content not in p:
+                        p = f"{p} {style_content}"
+                    p = f"{p} 图片比例【{ratio}】"
+                processed_prompts.append(p)
+
+            selected_prompts = processed_prompts
+
+            # 设置计数器
+            self.total_images = len(selected_prompts)
+            self.completed_images = 0
+
+            # 记录开始时间（用于性能统计）
+            self.generation_start_time = time.time()
+
+            # 显示整体进度
+            if hasattr(self, 'overall_progress_bar'):
+                self.overall_progress_bar.setVisible(True)
+            if hasattr(self, 'overall_progress_label'):
+                self.overall_progress_label.setText(f"🔄 重新生成选中的 {len(selected_prompts)} 张图片...")
+
+            # 更新进度显示
+            self.update_generation_progress()
+
+            # 更新按钮状态
+            if hasattr(self, 'regenerate_selected_button'):
+                self.regenerate_selected_button.setText("🔄 生成中...")
+                self.regenerate_selected_button.setEnabled(False)
+
+            # 记录异步性能信息
+            logging.info(f"=== 重新生成选中项开始 ===")
+            logging.info(f"并发任务数: {getattr(self, 'max_concurrent_tasks', 1)}")
+            logging.info(f"选中图片数: {len(selected_prompts)}")
+            logging.info(f"预计性能提升: {min(len(selected_prompts), getattr(self, 'max_concurrent_tasks', 1))}x")
+
+            # 获取图片数据映射
+            image_data_map = self.get_image_data_map()
+
+            # 为每个选中的提示词创建异步任务
+            for i, prompt in enumerate(selected_prompts):
+                try:
+                    # 从提示词中提取图片名称
+                    image_names = self.extract_image_names(prompt)
+
+                    # 获取对应的图片数据
+                    image_data_list = []
+                    for name in image_names:
+                        if name in image_data_map:
+                            image_data_list.append(image_data_map[name])
+
+                    # 获取对应的编号
+                    original_prompt = selected_original_prompts[i]
+                    if hasattr(self, 'prompt_numbers'):
+                        number = self.prompt_numbers.get(original_prompt, str(sorted(selected_rows)[i] + 1))
+                    else:
+                        number = str(sorted(selected_rows)[i] + 1)
+
+                    # 创建异步任务
+                    self.run_async_worker(prompt, image_data_list, number, sorted(selected_rows)[i], original_prompt)
+                except Exception as e:
+                    logging.error(f"创建重新生成任务失败 {i}: {str(e)}")
+                    self.handle_error(prompt, f"任务创建失败: {str(e)}", sorted(selected_rows)[i], selected_original_prompts[i])
+
+        except Exception as e:
+            logging.error(f"重新生成选中项总体失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"重新生成失败: {str(e)}")
+            # 重置按钮状态
+            if hasattr(self, 'regenerate_selected_button'):
+                self.regenerate_selected_button.setText("🔄 重新生成选中")
+                self.regenerate_selected_button.setEnabled(True)
     def start_regenerate_all(self):
         """重新生成全部提示词"""
         # 确认操作
@@ -3679,9 +5258,9 @@ class MainWindow(QMainWindow):
                 else:
                     data['status'] = '生成中'
                 break
-        
-        # 刷新表格显示
-        self.refresh_prompt_table()
+
+        # 使用QTimer确保UI更新在主线程中执行
+        QTimer.singleShot(0, self.refresh_prompt_table)
     
     def handle_success(self, prompt, image_url, number, index, original_prompt):
         """处理成功"""
@@ -3696,25 +5275,25 @@ class MainWindow(QMainWindow):
                 actual_number = data['number']  # 使用表格中的编号
                 found = True
                 break
-        
+
         # 存储图片信息
         self.generated_images[prompt] = image_url
-        
-        # 刷新表格显示（显示下载中状态）
-        self.refresh_prompt_table()
-        
+
+        # 使用QTimer确保UI更新在主线程中执行
+        QTimer.singleShot(0, self.refresh_prompt_table)
+
         # 自动保存图片（异步下载）
         if self.save_path:
             asyncio.create_task(self.download_image_async(image_url, actual_number, original_prompt))
         else:
             # 如果没有保存路径，直接设为成功
             self.mark_download_complete(original_prompt)
-        
+
         # 动态计算当前任务状态
-        self.update_generation_progress()
-        
+        QTimer.singleShot(10, self.update_generation_progress)
+
         # 检查是否当前批次全部完成
-        self.check_generation_completion()
+        QTimer.singleShot(20, self.check_generation_completion)
     
     def get_unique_filename(self, number, save_path):
         """生成不重复的文件名"""
@@ -3841,10 +5420,12 @@ class MainWindow(QMainWindow):
         if not found:
             logging.warning(f"未找到匹配的提示词: {original_prompt}")
             logging.info(f"当前表格中的提示词: {[data['prompt'] for data in self.prompt_table_data]}")
-        self.refresh_prompt_table()
-        self.update_generation_progress()
-        self.check_generation_completion()
-    
+
+        # 使用QTimer确保UI更新在主线程中执行
+        QTimer.singleShot(0, self.refresh_prompt_table)
+        QTimer.singleShot(10, self.update_generation_progress)
+        QTimer.singleShot(20, self.check_generation_completion)
+
     def mark_download_failed(self, original_prompt, error_msg):
         """标记下载失败"""
         for data in self.prompt_table_data:
@@ -3852,9 +5433,11 @@ class MainWindow(QMainWindow):
                 data['status'] = '失败'
                 data['error_msg'] = f"下载失败: {error_msg}"
                 break
-        self.refresh_prompt_table()
-        self.update_generation_progress()
-        self.check_generation_completion()
+
+        # 使用QTimer确保UI更新在主线程中执行
+        QTimer.singleShot(0, self.refresh_prompt_table)
+        QTimer.singleShot(10, self.update_generation_progress)
+        QTimer.singleShot(20, self.check_generation_completion)
     
     def refresh_thumbnail_for_number(self, number):
         """刷新指定编号的缩略图显示"""
@@ -3887,20 +5470,20 @@ class MainWindow(QMainWindow):
                 data['image_url'] = ''
                 data['error_msg'] = error
                 break
-        
-        # 刷新表格显示
-        self.refresh_prompt_table()
-        
+
+        # 使用QTimer确保UI更新在主线程中执行
+        QTimer.singleShot(0, self.refresh_prompt_table)
+
         # 记录错误
         logging.error(f"生成图片 {index+1} 失败:")
         logging.error(f"提示词: {prompt}")
         logging.error(f"错误信息: {error}")
-        
+
         # 动态计算当前任务状态
-        self.update_generation_progress()
-        
+        QTimer.singleShot(10, self.update_generation_progress)
+
         # 检查是否当前批次全部完成
-        self.check_generation_completion()
+        QTimer.singleShot(20, self.check_generation_completion)
     
     def update_generation_progress(self):
         """动态更新生成进度"""
@@ -3965,9 +5548,51 @@ class MainWindow(QMainWindow):
         
         # 更新状态显示
         self.overall_progress_label.setText(f"🎉 生成完成！成功: {success_count} 张，失败: {failed_count} 张")
-        
+
+        # 自动保存历史记录
+        self.auto_save_history()
+
         # 播放完成提示音
         self.play_completion_sound()
+
+    def auto_save_history(self):
+        """自动保存历史记录"""
+        try:
+            # 检查是否有数据需要保存
+            if not self.prompt_table_data:
+                return
+
+            # 生成自动保存的文件名
+            timestamp = time.strftime('%Y%m%d_%H%M%S')
+            filename = f"auto_save_{timestamp}"
+
+            # 准备配置数据
+            config_data = {
+                'api_platform': self.api_platform,
+                'model_type': self.model_type,
+                'thread_count': self.thread_count,
+                'retry_count': self.retry_count,
+                'image_ratio': self.image_ratio,
+                'current_style': self.current_style,
+                'custom_style_content': self.custom_style_content
+            }
+
+            # 保存历史记录
+            saved_path = save_history_record(self.prompt_table_data, config_data, filename)
+
+            if saved_path:
+                logging.info(f"自动保存历史记录成功: {saved_path}")
+                # 更新状态显示，显示自动保存信息
+                success_count = len([data for data in self.prompt_table_data if data['status'] == '成功'])
+                failed_count = len([data for data in self.prompt_table_data if data['status'] == '失败'])
+                self.overall_progress_label.setText(
+                    f"🎉 生成完成！成功: {success_count} 张，失败: {failed_count} 张 | 📁 已自动保存历史记录"
+                )
+            else:
+                logging.error("自动保存历史记录失败")
+
+        except Exception as e:
+            logging.error(f"自动保存历史记录异常: {e}")
     
     def check_default_config(self):
         """检查并创建默认配置文件"""
