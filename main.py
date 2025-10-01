@@ -319,7 +319,7 @@ class SettingsDialog(QDialog):
             self.api_key = ""
             self.api_platform = "云雾"
             self.model_type = "sora_image"
-            self.thread_count = 5
+            self.thread_count = 50
             self.retry_count = 3
             self.save_path = ""
             self.image_ratio = "3:2"
@@ -680,30 +680,35 @@ class SettingsDialog(QDialog):
         
         right_layout.addLayout(image_buttons_layout)
         
-        # 图片列表表格
-        self.image_table = QTableWidget()
-        self.image_table.setColumnCount(2)
-        self.image_table.setHorizontalHeaderLabels(["图片名称", "路径/链接"])
-        self.image_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.image_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.image_table.cellChanged.connect(self.on_image_changed)
-        self.image_table.cellDoubleClicked.connect(self.on_image_table_double_clicked)
-        right_layout.addWidget(self.image_table)
+        # 图库视图（横排缩略图 + 名称在下方）
+        self.image_gallery = QListWidget()
+        self.image_gallery.setViewMode(QListWidget.ViewMode.IconMode)
+        self.image_gallery.setFlow(QListWidget.Flow.LeftToRight)
+        self.image_gallery.setWrapping(True)
+        self.image_gallery.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.image_gallery.setMovement(QListWidget.Movement.Static)
+        self.image_gallery.setIconSize(QSize(128, 128))
+        self.image_gallery.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.image_gallery.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+            | QAbstractItemView.EditTrigger.SelectedClicked
+        )
+        self.image_gallery.itemChanged.connect(self.on_gallery_item_changed)
+        right_layout.addWidget(self.image_gallery)
         
-        # 使用说明
+        # 使用说明（简化，移除网络图片说明）
         tips_layout = QVBoxLayout()
         tips_label = QLabel("""
 <b>使用说明:</b><br>
 • 点击"添加图片"选择本地图片文件，系统会自动复制到项目目录<br>
 • <b>图片名称在全局范围内必须唯一</b>，不允许在不同分类中有重复名称<br>
 • 在提示词中包含图片名称，系统会自动添加对应的参考图<br>
-• 建议每个提示词最多包含3-4张参考图<br>
-• 支持本地图片（优先）和网络图片链接（兼容旧版本）
+• 建议每个提示词最多包含3-4张参考图
         """)
         tips_label.setWordWrap(True)
         tips_label.setStyleSheet("color: #666; background-color: #f8f9fa; padding: 10px; border-radius: 6px; font-size: 12px;")
         tips_layout.addWidget(tips_label)
-        
         right_layout.addLayout(tips_layout)
         
         # 添加到分割器
@@ -1446,31 +1451,31 @@ class SettingsDialog(QDialog):
             self.current_category = ""
     
     def load_images_to_table(self, category_name):
-        """将图片加载到表格"""
+        """将图片加载到图库视图"""
         images = self.category_links.get(category_name, [])
-        self.image_table.setRowCount(len(images))
-        
-        self.image_table.blockSignals(True)
-        for row, image in enumerate(images):
-            name_item = QTableWidgetItem(image.get('name', ''))
-            self.image_table.setItem(row, 0, name_item)
-            
-            # 显示路径或URL
-            if 'path' in image and image['path']:
-                # 本地图片，显示路径
-                path_item = QTableWidgetItem(image['path'])
-                path_item.setToolTip(f"本地图片: {image['path']}")
-            else:
-                # 网络图片，显示URL
-                path_item = QTableWidgetItem(image.get('url', ''))
-                path_item.setToolTip(f"网络图片: {image.get('url', '')}")
-            
-            self.image_table.setItem(row, 1, path_item)
-        self.image_table.blockSignals(False)
+        self.image_gallery.blockSignals(True)
+        self.image_gallery.clear()
+        for image in images:
+            name = image.get('name', '')
+            local_path = APP_PATH / image.get('path', '') if image.get('path') else None
+            item = QListWidgetItem()
+            item.setText(name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+            # 设置图标
+            icon = QIcon()
+            if local_path and local_path.exists():
+                pix = QPixmap(str(local_path))
+                if not pix.isNull():
+                    icon = QIcon(pix)
+            item.setIcon(icon)
+            # 存储引用
+            item.setData(Qt.ItemDataRole.UserRole, image)
+            self.image_gallery.addItem(item)
+        self.image_gallery.blockSignals(False)
     
     def clear_image_table(self):
-        """清空图片表格"""
-        self.image_table.setRowCount(0)
+        """清空图库视图"""
+        self.image_gallery.clear()
     
     def new_category(self):
         """新建分类"""
@@ -1551,76 +1556,28 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "提示", "请先选择分类")
             return
         
-        # 弹出文件选择对话框
-        file_path, _ = QFileDialog.getOpenFileName(
+        # 选择多个本地图片文件
+        file_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "选择图片文件",
+            "选择图片文件（可多选）",
             "",
             "图片文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;所有文件 (*)"
         )
         
-        if file_path:
-            # 获取图片名称（用户可以修改）
-            default_name = Path(file_path).stem
-            
-            while True:
-                name, ok = QInputDialog.getText(
-                    self, 
-                    "输入图片名称", 
-                    "请输入图片名称（用于在提示词中引用）:\n注意：图片名称在全局范围内必须唯一",
-                    text=default_name
-                )
-                
-                if not ok:
-                    return
-                    
-                if not name.strip():
-                    QMessageBox.warning(self, "提示", "图片名称不能为空")
-                    continue
-                
-                name = name.strip()
-                
-                # 检查名称是否全局唯一
-                unique, existing_category = self.check_image_name_unique(name)
-                if not unique:
-                    reply = QMessageBox.question(
-                        self, 
-                        "名称重复", 
-                        f"图片名称 '{name}' 已存在于分类 '{existing_category}' 中。\n\n"
-                        f"是否使用建议的唯一名称 '{self.get_unique_image_name(name)}' ？",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
-                        QMessageBox.StandardButton.Yes
-                    )
-                    
-                    if reply == QMessageBox.StandardButton.Yes:
-                        name = self.get_unique_image_name(name)
-                        break
-                    elif reply == QMessageBox.StandardButton.No:
-                        default_name = name  # 保持用户输入的名称作为下次的默认值
-                        continue
-                    else:  # Cancel
-                        return
-                else:
-                    break
-            
-            try:
-                # 复制图片到分类目录
-                relative_path = copy_image_to_category(file_path, self.current_category, name)
-                
-                # 添加到配置中
-                images = self.category_links[self.current_category]
-                images.append({
-                    'name': name,
-                    'path': relative_path,
-                    'url': ''  # 保留URL字段以兼容旧版本
-                })
-                
-                self.load_images_to_table(self.current_category)
-                QMessageBox.information(self, "成功", f"图片 '{name}' 已添加到分类 '{self.current_category}'")
-                
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"添加图片失败: {str(e)}")
-                logging.error(f"添加图片失败: {e}")
+        if file_paths:
+            added = 0
+            images = self.category_links[self.current_category]
+            for fp in file_paths:
+                try:
+                    base_name = Path(fp).stem
+                    unique_name = self.get_unique_image_name(base_name)
+                    relative_path = copy_image_to_category(fp, self.current_category, unique_name)
+                    images.append({'name': unique_name, 'path': relative_path})
+                    added += 1
+                except Exception as e:
+                    logging.error(f"添加图片失败: {e}")
+            self.load_images_to_table(self.current_category)
+            QMessageBox.information(self, "完成", f"已添加 {added} 张图片到分类 '{self.current_category}'")
     
     def delete_image(self):
         """删除选中的图片"""
@@ -1628,15 +1585,15 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "提示", "请先选择分类")
             return
         
-        selected_rows = set(idx.row() for idx in self.image_table.selectedIndexes())
-        if not selected_rows:
+        selected_items = self.image_gallery.selectedItems()
+        if not selected_items:
             QMessageBox.warning(self, "提示", "请先选择要删除的图片")
             return
         
         reply = QMessageBox.question(
             self,
             "确认删除",
-            f"确定要删除选中的 {len(selected_rows)} 张图片吗？\n此操作会删除本地图片文件，不可撤销。",
+            f"确定要删除选中的 {len(selected_items)} 张图片吗？\n此操作会删除本地图片文件，不可撤销。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
@@ -1644,86 +1601,71 @@ class SettingsDialog(QDialog):
         if reply == QMessageBox.StandardButton.Yes:
             images = self.category_links[self.current_category]
             deleted_count = 0
-            
-            for row in sorted(selected_rows, reverse=True):
-                if 0 <= row < len(images):
-                    image = images[row]
-                    
-                    # 删除本地文件（如果存在path字段）
-                    if 'path' in image and image['path']:
-                        local_path = APP_PATH / image['path']
-                        if local_path.exists():
-                            try:
-                                local_path.unlink()
-                                logging.info(f"删除本地图片文件: {local_path}")
-                            except Exception as e:
-                                logging.error(f"删除本地图片文件失败: {e}")
-                    
-                    # 从配置中删除
-                    images.pop(row)
+            # 从图库选择项删除
+            for item in selected_items:
+                image = item.data(Qt.ItemDataRole.UserRole)
+                # 删除本地文件
+                rel = image.get('path', '')
+                if rel:
+                    local_path = APP_PATH / rel
+                    if local_path.exists():
+                        try:
+                            local_path.unlink()
+                            logging.info(f"删除本地图片文件: {local_path}")
+                        except Exception as e:
+                            logging.error(f"删除本地图片文件失败: {e}")
+                # 从配置中删除
+                try:
+                    images.remove(image)
                     deleted_count += 1
-            
+                except ValueError:
+                    pass
             self.load_images_to_table(self.current_category)
             if deleted_count > 0:
                 QMessageBox.information(self, "删除完成", f"已删除 {deleted_count} 张图片")
     
-    def on_image_changed(self, row, column):
-        """图片信息改变时"""
+    def on_gallery_item_changed(self, item):
+        """图库视图项名称修改：校验唯一性并同步重命名文件名"""
         if not self.current_category:
             return
-        
-        images = self.category_links[self.current_category]
-        if 0 <= row < len(images):
-            name = self.image_table.item(row, 0).text() if self.image_table.item(row, 0) else ''
-            path_or_url = self.image_table.item(row, 1).text() if self.image_table.item(row, 1) else ''
-            
-            # 如果修改的是名称列（column 0），需要检查唯一性
-            if column == 0 and name.strip():
-                old_name = images[row]['name']
-                new_name = name.strip()
-                
-                # 如果名称确实改变了，检查全局唯一性
-                if new_name != old_name:
-                    unique, existing_category = self.check_image_name_unique(new_name, self.current_category, old_name)
-                    if not unique:
-                        QMessageBox.warning(
-                            self, 
-                            "名称重复", 
-                            f"图片名称 '{new_name}' 已存在于分类 '{existing_category}' 中。\n"
-                            f"图片名称在全局范围内必须唯一。"
-                        )
-                        # 恢复原名称
-                        self.image_table.item(row, 0).setText(old_name)
-                        return
-            
-            # 如果是路径格式（以images/开头），更新path字段；否则更新url字段
-            if path_or_url.startswith('images/'):
-                images[row] = {'name': name, 'path': path_or_url, 'url': images[row].get('url', '')}
+        image = item.data(Qt.ItemDataRole.UserRole)
+        old_name = image.get('name', '')
+        new_name = item.text().strip()
+        if not new_name or new_name == old_name:
+            return
+        # 唯一性校验
+        unique, existing_category = self.check_image_name_unique(new_name, self.current_category, old_name)
+        if not unique:
+            QMessageBox.warning(self, "名称重复", f"图片名称 '{new_name}' 已存在于分类 '{existing_category}' 中。\n图片名称在全局范围内必须唯一。")
+            # 恢复名称
+            item.setText(old_name)
+            return
+        # 同步重命名文件
+        old_path_rel = image.get('path', '')
+        if old_path_rel and old_path_rel.startswith('images/'):
+            old_path = APP_PATH / old_path_rel
+            if old_path.exists():
+                suffix = old_path.suffix
+                new_rel = f"images/{self.current_category}/{new_name}{suffix}"
+                new_path = APP_PATH / new_rel
+                try:
+                    old_path.rename(new_path)
+                    image['name'] = new_name
+                    image['path'] = new_rel
+                    item.setData(Qt.ItemDataRole.UserRole, image)
+                except Exception as e:
+                    QMessageBox.warning(self, "重命名失败", f"无法重命名文件:\n{e}")
+                    item.setText(old_name)
             else:
-                images[row] = {'name': name, 'url': path_or_url, 'path': images[row].get('path', '')}
+                # 文件不存在，仅更新名称
+                image['name'] = new_name
+                item.setData(Qt.ItemDataRole.UserRole, image)
+        else:
+            image['name'] = new_name
+            item.setData(Qt.ItemDataRole.UserRole, image)
     
     def on_image_table_double_clicked(self, row, column):
-        """图片表格双击事件 - 预览图片"""
-        if not self.current_category:
-            return
-        
-        images = self.category_links[self.current_category]
-        if 0 <= row < len(images):
-            image = images[row]
-            image_name = image.get('name', '')
-            
-            if 'path' in image and image['path']:
-                # 本地图片预览
-                local_path = APP_PATH / image['path']
-                if local_path.exists():
-                    self.show_image_preview(image_name, str(local_path), is_local=True)
-                else:
-                    QMessageBox.warning(self, "文件不存在", f"本地图片文件不存在:\n{local_path}")
-            elif 'url' in image and image['url']:
-                # 网络图片预览（显示URL信息）
-                self.show_image_preview(image_name, image['url'], is_local=False)
-            else:
-                QMessageBox.information(self, "提示", "该图片没有有效的路径或链接")
+        pass
     
     def show_image_preview(self, image_name, path_or_url, is_local=True):
         """显示图片预览对话框"""
@@ -2014,6 +1956,8 @@ class BatchEditDialog(QDialog):
             "查找替换 - 将指定文本替换为新文本",
             "删除文本 - 删除提示词中的指定文本"
         ])
+        # 默认选择“查找替换”
+        self.operation_combo.setCurrentText("查找替换 - 将指定文本替换为新文本")
         self.operation_combo.currentTextChanged.connect(self.on_operation_changed)
         operation_layout.addWidget(self.operation_combo)
 
@@ -2956,7 +2900,7 @@ class MainWindow(QMainWindow):
         self.api_platform = "云雾"
         self.model_type = "sora_image"  # 默认使用sora_image模型
         self.allow_insecure_ssl = False
-        self.thread_count = 5
+        self.thread_count = 50
         self.retry_count = 3
         self.save_path = ""
         self.image_ratio = "3:2"
@@ -3203,6 +3147,11 @@ class MainWindow(QMainWindow):
         self.import_csv_button = QPushButton("📁 导入CSV文件")
         self.import_csv_button.clicked.connect(self.import_csv)
         button_layout.addWidget(self.import_csv_button)
+
+        # 粘贴导入按钮
+        self.paste_import_button = QPushButton("📋 粘贴导入")
+        self.paste_import_button.clicked.connect(self.import_from_clipboard)
+        button_layout.addWidget(self.paste_import_button)
         
         self.add_prompt_button = QPushButton("➕ 添加提示词")
         self.add_prompt_button.clicked.connect(self.add_prompt)
@@ -3881,13 +3830,16 @@ class MainWindow(QMainWindow):
                     QMessageBox.critical(self, "错误", "无法读取CSV文件，请确保文件编码为UTF-8、GBK、GB2312或GB18030")
                     return
                 
-                # 检查是否存在"分镜提示词"列
+                # 检查并兼容提示词列（分镜提示词/首帧提示词）
                 if "分镜提示词" not in df.columns:
-                    QMessageBox.critical(self, "错误", "CSV文件中没有找到'分镜提示词'列")
-                    return
+                    if "首帧提示词" in df.columns:
+                        df.rename(columns={"首帧提示词": "分镜提示词"}, inplace=True)
+                    else:
+                        QMessageBox.critical(self, "错误", "CSV文件中没有找到'分镜提示词'或'首帧提示词'列")
+                        return
                 
-                # 检查是否存在"分镜编号"列
-                has_number_column = "分镜编号" in df.columns
+                # 检查是否存在编号列（分镜编号/分镜数）
+                has_number_column = ("分镜编号" in df.columns) or ("分镜数" in df.columns)
                 
                 # 清空现有数据
                 self.prompt_table_data.clear()
@@ -3901,7 +3853,7 @@ class MainWindow(QMainWindow):
                         
                         # 确定编号
                         if has_number_column:
-                            number = row["分镜编号"]
+                            number = row["分镜编号"] if "分镜编号" in df.columns else row.get("分镜数")
                             if pd.notna(number):
                                 display_number = str(number)
                             else:
@@ -3927,6 +3879,113 @@ class MainWindow(QMainWindow):
                 
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导入CSV文件失败: {str(e)}")
+
+    def import_from_clipboard(self):
+        """从剪贴板导入（文本或CSV文件路径/URL）"""
+        cb = QApplication.clipboard()
+        md = cb.mimeData()
+        # 1) 若剪贴板包含文件URL（本地CSV）
+        if md.hasUrls():
+            for url in md.urls():
+                local = url.toLocalFile()
+                if local and local.lower().endswith('.csv'):
+                    try:
+                        encodings = ['utf-8', 'gbk', 'gb2312', 'gb18030']
+                        df = None
+                        for encoding in encodings:
+                            try:
+                                df = pd.read_csv(local, encoding=encoding)
+                                break
+                            except UnicodeDecodeError:
+                                continue
+                        if df is None:
+                            QMessageBox.critical(self, "错误", "无法读取CSV文件，请确保文件编码为UTF-8、GBK、GB2312或GB18030")
+                            return
+                        # 列名兼容
+                        if "分镜提示词" not in df.columns:
+                            if "首帧提示词" in df.columns:
+                                df.rename(columns={"首帧提示词": "分镜提示词"}, inplace=True)
+                            else:
+                                QMessageBox.critical(self, "错误", "CSV文件中没有找到'分镜提示词'或'首帧提示词'列")
+                                return
+                        has_number_column = ("分镜编号" in df.columns) or ("分镜数" in df.columns)
+                        # 清空并导入
+                        self.prompt_table_data.clear()
+                        self.prompt_numbers.clear()
+                        for index, row in df.iterrows():
+                            prompt = row["分镜提示词"]
+                            if pd.notna(prompt):
+                                prompt_str = str(prompt)
+                                if has_number_column:
+                                    number = row["分镜编号"] if "分镜编号" in df.columns else row.get("分镜数")
+                                    display_number = str(number) if pd.notna(number) else str(index + 1)
+                                else:
+                                    display_number = str(index + 1)
+                                self.prompt_table_data.append({
+                                    'number': display_number,
+                                    'prompt': prompt_str,
+                                    'status': '等待中',
+                                    'image_url': '',
+                                    'error_msg': ''
+                                })
+                                self.prompt_numbers[prompt_str] = display_number
+                        self.refresh_prompt_table()
+                        self.update_prompt_stats()
+                        QMessageBox.information(self, "成功", f"成功导入 {len(self.prompt_table_data)} 个提示词")
+                        return
+                    except Exception as e:
+                        QMessageBox.critical(self, "错误", f"导入剪贴板CSV失败: {str(e)}")
+                        return
+        # 2) 作为文本解析（支持CSV/TSV，含引号多行）
+        text = cb.text()
+        if not text or text.strip() == '':
+            QMessageBox.warning(self, "提示", "剪贴板没有可用内容")
+            return
+        try:
+            from io import StringIO
+            # 自动分隔符检测：制表符优先于逗号（Excel复制常见）
+            sep = '\t' if text.count('\t') >= text.count(',') else ','
+            df = pd.read_csv(StringIO(text), sep=sep)
+            # 列名兼容
+            if "分镜提示词" not in df.columns:
+                if "首帧提示词" in df.columns:
+                    df.rename(columns={"首帧提示词": "分镜提示词"}, inplace=True)
+                else:
+                    for alias in ["提示词", "分镜提示词", "prompt"]:
+                        if alias in df.columns:
+                            df.rename(columns={alias: "分镜提示词"}, inplace=True)
+                            break
+            if "分镜提示词" not in df.columns:
+                QMessageBox.critical(self, "错误", "剪贴板文本中没有找到'分镜提示词'或'首帧提示词'列")
+                return
+            # 识别编号列
+            number_keys = ["分镜编号", "分镜数", "编号", "number", "id"]
+            number_key_found = next((k for k in number_keys if k in df.columns), None)
+            # 清空并导入
+            self.prompt_table_data.clear()
+            self.prompt_numbers.clear()
+            for index, row in df.iterrows():
+                prompt = row["分镜提示词"]
+                if pd.notna(prompt):
+                    prompt_str = str(prompt)
+                    if number_key_found is not None:
+                        number = row[number_key_found]
+                        display_number = str(number) if pd.notna(number) else str(index + 1)
+                    else:
+                        display_number = str(index + 1)
+                    self.prompt_table_data.append({
+                        'number': display_number,
+                        'prompt': prompt_str,
+                        'status': '等待中',
+                        'image_url': '',
+                        'error_msg': ''
+                    })
+                    self.prompt_numbers[prompt_str] = display_number
+            self.refresh_prompt_table()
+            self.update_prompt_stats()
+            QMessageBox.information(self, "成功", f"成功导入 {len(self.prompt_table_data)} 个提示词（剪贴板）")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"剪贴板文本解析失败: {str(e)}")
     
     def clear_prompts(self):
         """清空导入的提示词列表"""
@@ -4433,26 +4492,50 @@ class MainWindow(QMainWindow):
         return image_data_map
     
     def extract_image_names(self, prompt):
-        """从提示词中提取图片名称"""
-        image_names = []
-        all_names = []
-        
+        """从提示词中提取图片名称（边界匹配 + 最长优先遮盖）"""
+        import re
+        # 规范化：去掉全角空格，统一括号为中文全角
+        text = str(prompt)
+        text = text.replace('\u3000', ' ')
+        text = text.replace('(', '（').replace(')', '）')
+
         # 收集所有图片名称
+        names = []
         for cat_links in self.category_links.values():
             for link in cat_links:
-                name = link['name'].strip()
+                name = (link.get('name') or '').strip()
                 if name:
-                    all_names.append(name)
-        
-        # 按长度排序，优先匹配更长的名称
-        all_names.sort(key=len, reverse=True)
-        
-        # 找到所有能匹配的图片名称
-        for name in all_names:
-            if name in prompt:
-                image_names.append(name)
-        
-        return image_names
+                    names.append(name)
+
+        # 按长度降序，最长优先
+        names = sorted(set(names), key=len, reverse=True)
+
+        # 定义“字边界”：非中英数为边界；对CJK作近似处理
+        def compile_pattern(n):
+            esc = re.escape(n)
+            return re.compile(rf"(?<![A-Za-z0-9一-龥]){esc}(?![A-Za-z0-9一-龥])")
+
+        matched = []
+        masked = list(text)
+        for n in names:
+            pat = compile_pattern(n)
+            for m in pat.finditer(text):
+                s, e = m.span()
+                # 检查该区域是否已被遮盖
+                if any(ch == '\0' for ch in masked[s:e]):
+                    continue
+                matched.append(n)
+                # 遮盖已命中的片段，防止短名二次命中
+                for i in range(s, e):
+                    masked[i] = '\0'
+        # 去重保持顺序
+        seen = set()
+        ordered = []
+        for n in matched:
+            if n not in seen:
+                seen.add(n)
+                ordered.append(n)
+        return ordered
     
     def start_generation(self):
         """开始生成图片"""
