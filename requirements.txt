@@ -4,3 +4,4 @@ PyQt6
 pyinstaller
 aiofiles
 aiohttp
+qasync

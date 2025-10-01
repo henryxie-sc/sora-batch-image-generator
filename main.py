@@ -7,8 +7,6 @@ import re
 import pandas as pd
 import os
 import time
-import base64
-import shutil
 import ssl
 from pathlib import Path
 import concurrent.futures
@@ -22,6 +20,23 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QFrame, QProgressBar, QTabWidget, QAbstractItemView, QStyledItemDelegate, QStyle)
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSize
 from PyQt6.QtGui import QPixmap, QImage, QFont, QPalette, QColor, QIcon, QTextOption
+
+# 引入拆分后的服务模块
+from services.pathing import APP_PATH, IMAGES_PATH
+from services.images import (
+    ensure_images_directory,
+    create_category_directory,
+    rename_category_directory,
+    delete_category_directory,
+    copy_image_to_category,
+    image_to_base64,
+)
+from services.history import (
+    ensure_history_directory,
+    save_history_record,
+    load_history_record,
+    get_history_files,
+)
 
 # 自定义checkbox类，避免lambda闭包问题
 class RowCheckBox(QCheckBox):
@@ -48,18 +63,10 @@ try:
 except ImportError:
     subprocess = None
 
-def get_app_path():
-    """获取应用程序路径，支持打包后的exe"""
-    if getattr(sys, 'frozen', False):
-        return Path(sys.executable).parent
-    else:
-        return Path(__file__).parent
+# 路径相关已迁移至 services/pathing.py
 
-APP_PATH = get_app_path()
-IMAGES_PATH = APP_PATH / 'images'
-
-def setup_ssl_context():
-    """设置SSL上下文，解决证书验证问题"""
+def setup_ssl_context(allow_insecure_ssl: bool = False):
+    """设置SSL上下文。默认开启证书验证；当 allow_insecure_ssl 为 True 时禁用验证。"""
     try:
         # 创建SSL上下文
         ssl_context = ssl.create_default_context()
@@ -73,267 +80,21 @@ def setup_ssl_context():
                 logging.info("已加载macOS系统证书")
             except ImportError:
                 logging.info("certifi库未安装，跳过证书加载")
-        
-        # 为了兼容性，禁用主机名检查和证书验证
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        
-        logging.info("SSL上下文已配置 (跳过证书验证)")
+        # 根据配置决定是否禁用验证
+        if allow_insecure_ssl:
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            logging.info("SSL上下文已配置 (不安全模式：跳过证书验证)")
+        else:
+            logging.info("SSL上下文已配置 (安全模式：启用证书验证)")
         return ssl_context
         
     except Exception as e:
         logging.warning(f"SSL配置失败，将完全禁用SSL验证: {e}")
         return False
 
-def ensure_images_directory():
-    """确保images目录存在"""
-    if not IMAGES_PATH.exists():
-        IMAGES_PATH.mkdir(parents=True, exist_ok=True)
-        logging.info(f"创建图片目录: {IMAGES_PATH}")
 
-def create_category_directory(category_name):
-    """创建分类目录"""
-    ensure_images_directory()
-    category_path = IMAGES_PATH / category_name
-    if not category_path.exists():
-        category_path.mkdir(parents=True, exist_ok=True)
-        logging.info(f"创建分类目录: {category_path}")
-    return category_path
-
-def rename_category_directory(old_name, new_name):
-    """重命名分类目录"""
-    ensure_images_directory()
-    old_path = IMAGES_PATH / old_name
-    new_path = IMAGES_PATH / new_name
-    
-    if old_path.exists() and not new_path.exists():
-        old_path.rename(new_path)
-        logging.info(f"重命名分类目录: {old_path} -> {new_path}")
-    elif not old_path.exists():
-        # 如果旧目录不存在，创建新目录
-        create_category_directory(new_name)
-
-def delete_category_directory(category_name):
-    """删除分类目录及其所有内容"""
-    ensure_images_directory()
-    category_path = IMAGES_PATH / category_name
-    if category_path.exists():
-        shutil.rmtree(category_path)
-        logging.info(f"删除分类目录: {category_path}")
-
-def copy_image_to_category(source_path, category_name, image_name):
-    """复制图片到分类目录"""
-    category_path = create_category_directory(category_name)
-    
-    # 获取文件扩展名
-    source_ext = Path(source_path).suffix
-    if not source_ext:
-        source_ext = '.png'  # 默认扩展名
-    
-    # 构建目标文件路径
-    target_filename = f"{image_name}{source_ext}"
-    target_path = category_path / target_filename
-    
-    # 复制文件
-    shutil.copy2(source_path, target_path)
-    logging.info(f"复制图片: {source_path} -> {target_path}")
-    
-    # 返回相对路径
-    return f"images/{category_name}/{target_filename}"
-
-def image_to_base64(image_path):
-    """将图片文件转换为base64编码"""
-    try:
-        with open(image_path, 'rb') as image_file:
-            encoded = base64.b64encode(image_file.read()).decode('utf-8')
-            # 根据文件扩展名确定MIME类型
-            ext = Path(image_path).suffix.lower()
-            if ext in ['.jpg', '.jpeg']:
-                mime_type = 'image/jpeg'
-            elif ext == '.png':
-                mime_type = 'image/png'
-            elif ext == '.gif':
-                mime_type = 'image/gif'
-            elif ext == '.webp':
-                mime_type = 'image/webp'
-            else:
-                mime_type = 'image/png'  # 默认
-            
-            return f"data:{mime_type};base64,{encoded}"
-    except Exception as e:
-        logging.error(f"转换图片为base64失败: {e}")
-        return None
-
-def ensure_history_directory():
-    """确保历史记录目录存在"""
-    history_path = APP_PATH / 'history'
-    if not history_path.exists():
-        history_path.mkdir(parents=True, exist_ok=True)
-        logging.info(f"创建历史记录目录: {history_path}")
-    return history_path
-
-def save_history_record(prompt_data, config_data, filename=None):
-    """保存历史记录到JSON文件，自动去重"""
-    import hashlib
-    import glob
-
-    try:
-        history_path = ensure_history_directory()
-
-        # 构建历史记录数据
-        history_record = {
-            'version': '3.4',
-            'created_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'total_prompts': len(prompt_data),
-            'success_count': len([p for p in prompt_data if p.get('status') == '成功']),
-            'failed_count': len([p for p in prompt_data if p.get('status') == '失败']),
-            'config': {
-                'api_platform': config_data.get('api_platform', ''),
-                'model_type': config_data.get('model_type', ''),
-                'thread_count': config_data.get('thread_count', 5),
-                'retry_count': config_data.get('retry_count', 3),
-                'image_ratio': config_data.get('image_ratio', '3:2'),
-                'current_style': config_data.get('current_style', ''),
-                'custom_style_content': config_data.get('custom_style_content', '')
-            },
-            'prompts': prompt_data
-        }
-
-        # 计算内容哈希值（仅基于配置和提示词，不包括时间戳和状态统计）
-        content_for_hash = {
-            'config': history_record['config'],
-            'prompts': [{'prompt': p.get('prompt', '')} for p in prompt_data]  # 只取提示词内容
-        }
-        content_str = json.dumps(content_for_hash, sort_keys=True, ensure_ascii=False)
-        content_hash = hashlib.md5(content_str.encode('utf-8')).hexdigest()
-
-        # 检查现有文件是否有相同内容
-        existing_files = glob.glob(str(history_path / "sora_history_*.json"))
-        duplicate_file = None
-
-        for existing_file in existing_files:
-            try:
-                with open(existing_file, 'r', encoding='utf-8') as f:
-                    existing_data = json.load(f)
-
-                # 计算现有文件的哈希值
-                existing_content = {
-                    'config': existing_data.get('config', {}),
-                    'prompts': [{'prompt': p.get('prompt', '')} for p in existing_data.get('prompts', [])]
-                }
-                existing_str = json.dumps(existing_content, sort_keys=True, ensure_ascii=False)
-                existing_hash = hashlib.md5(existing_str.encode('utf-8')).hexdigest()
-
-                if existing_hash == content_hash:
-                    duplicate_file = existing_file
-                    break
-
-            except (json.JSONDecodeError, IOError, KeyError):
-                # 如果读取失败，忽略该文件
-                continue
-
-        # 如果找到重复文件，更新时间戳
-        if duplicate_file:
-            logging.info(f"发现重复内容，更新现有文件: {duplicate_file}")
-            # 更新现有文件的时间戳和统计信息
-            try:
-                with open(duplicate_file, 'r', encoding='utf-8') as f:
-                    existing_data = json.load(f)
-
-                # 更新时间戳和统计信息，保持其他内容不变
-                existing_data['created_time'] = history_record['created_time']
-                existing_data['total_prompts'] = history_record['total_prompts']
-                existing_data['success_count'] = history_record['success_count']
-                existing_data['failed_count'] = history_record['failed_count']
-                existing_data['prompts'] = prompt_data  # 更新完整的提示词数据（包括状态）
-
-                with open(duplicate_file, 'w', encoding='utf-8') as f:
-                    json.dump(existing_data, f, indent=2, ensure_ascii=False)
-
-                logging.info(f"历史记录已更新: {duplicate_file}")
-                return str(duplicate_file)
-
-            except Exception as e:
-                logging.error(f"更新重复文件失败: {e}")
-                # 如果更新失败，继续创建新文件
-
-        # 如果没有重复文件，创建新文件
-        if not filename:
-            timestamp = time.strftime('%Y%m%d_%H%M%S')
-            filename = f"sora_history_{timestamp}.json"
-
-        # 确保文件名以.json结尾
-        if not filename.endswith('.json'):
-            filename += '.json'
-
-        file_path = history_path / filename
-
-        # 保存到文件
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(history_record, f, indent=2, ensure_ascii=False)
-
-        logging.info(f"历史记录已保存: {file_path}")
-        return str(file_path)
-
-    except Exception as e:
-        logging.error(f"保存历史记录失败: {e}")
-        return None
-
-def load_history_record(file_path):
-    """从JSON文件加载历史记录"""
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            history_record = json.load(f)
-
-        logging.info(f"历史记录已加载: {file_path}")
-        return history_record
-
-    except Exception as e:
-        logging.error(f"加载历史记录失败: {e}")
-        return None
-
-def get_history_files():
-    """获取所有历史记录文件"""
-    try:
-        history_path = ensure_history_directory()
-        history_files = []
-
-        for file_path in history_path.glob('*.json'):
-            try:
-                # 读取文件的基本信息
-                stat = file_path.stat()
-                file_info = {
-                    'path': str(file_path),
-                    'name': file_path.name,
-                    'size': stat.st_size,
-                    'modified_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))
-                }
-
-                # 尝试读取文件内容获取更多信息
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    file_info.update({
-                        'created_time': data.get('created_time', file_info['modified_time']),
-                        'version': data.get('version', '未知'),
-                        'total_prompts': data.get('total_prompts', 0),
-                        'success_count': data.get('success_count', 0),
-                        'failed_count': data.get('failed_count', 0)
-                    })
-
-                history_files.append(file_info)
-
-            except Exception as e:
-                # 如果读取单个文件失败，继续处理其他文件
-                logging.warning(f"读取历史文件失败: {file_path}, 错误: {e}")
-                continue
-
-        # 按修改时间排序，最新的在前
-        history_files.sort(key=lambda x: x['modified_time'], reverse=True)
-        return history_files
-
-    except Exception as e:
-        logging.error(f"获取历史文件列表失败: {e}")
-        return []
+## 历史记录与图片工具函数已迁移到 services/
 
 # 配置日志
 logging.basicConfig(
@@ -365,237 +126,23 @@ class AsyncWorker:
             # 发送进度信号
             self.signals.progress.emit(self.prompt, "生成中...")
             
-            # 验证API密钥
-            if not self.api_key:
-                raise ValueError("API密钥不能为空")
-                
-            # 构建API请求 - 所有模型都使用标准端点
-            if self.api_platform == "云雾":
-                api_url = "https://yunwu.ai/v1/chat/completions"
-            elif self.api_platform == "apicore":
-                api_url = "https://api.apicore.ai/v1/chat/completions"
-            else:  # API易
-                api_url = "https://vip.apiyi.com/v1/chat/completions"
-
-            # 设置请求头
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}"
-            }
-            
-            # 构建消息内容
-            content = [{"type": "text", "text": self.prompt}]
-            
-            # 记录图片路径信息用于日志
-            image_path_info = []
-            
-            # 添加图片（支持URL和本地文件）
-            for img_data in self.image_data:
-                if 'path' in img_data and img_data['path']:
-                    # 本地图片，转换为base64
-                    local_path = APP_PATH / img_data['path']
-                    if local_path.exists():
-                        base64_url = image_to_base64(local_path)
-                        if base64_url:
-                            content.append({
-                                "type": "image_url",
-                                "image_url": {"url": base64_url}
-                            })
-                            # 记录路径信息用于日志
-                            image_path_info.append(f"本地图片: {img_data['name']} -> {img_data['path']}")
-                            logging.info(f"添加本地图片: {img_data['name']} -> {img_data['path']}")
-                        else:
-                            logging.warning(f"本地图片转换base64失败: {img_data['path']}")
-                    else:
-                        logging.warning(f"本地图片文件不存在: {img_data['path']}")
-                elif 'url' in img_data and img_data['url']:
-                    # 网络图片，使用URL
-                    content.append({
-                        "type": "image_url",
-                        "image_url": {"url": img_data['url']}
-                    })
-                    # 记录URL信息用于日志
-                    image_path_info.append(f"网络图片: {img_data['name']} -> {img_data['url']}")
-                    logging.info(f"添加网络图片: {img_data['name']} -> {img_data['url']}")
-            
-            # 构建请求载荷 - 根据模型类型选择格式
-            if self.model_type == "nano-banana":
-                # nano-banana模型使用Gemini 2.5 Flash Image Preview
-                payload = {
-                    "model": "gemini-2.5-flash-image-preview",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a helpful assistant."
-                        },
-                        {
-                            "role": "user",
-                            "content": content
-                        }
-                    ]
-                }
-            else:
-                # sora_image模型使用标准格式
-                payload = {
-                    "model": "sora_image",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a helpful assistant."
-                        },
-                        {
-                            "role": "user",
-                            "content": content
-                        }
-                    ]
-                }
-            
-            # 记录请求信息
-            logging.info("发送API请求:")
-            logging.info(f"URL: {api_url}")
-            
-            # 创建用于日志记录的payload副本，替换BASE64图片数据为路径信息
-            log_payload = payload.copy()
-            if 'messages' in log_payload:
-                log_messages = []
-                for msg in log_payload['messages']:
-                    log_msg = msg.copy()
-                    if 'content' in msg and isinstance(msg['content'], list):
-                        log_content = []
-                        image_index = 0  # 图片索引计数器
-                        for item in msg['content']:
-                            if item.get('type') == 'image_url' and 'image_url' in item:
-                                # 替换BASE64数据为实际路径信息
-                                if image_index < len(image_path_info):
-                                    path_info = image_path_info[image_index]
-                                    log_item = {
-                                        "type": "image_url",
-                                        "image_url": {"url": f"[{path_info}]"}
-                                    }
-                                else:
-                                    log_item = {
-                                        "type": "image_url",
-                                        "image_url": {"url": "[图片路径信息缺失]"}
-                                    }
-                                log_content.append(log_item)
-                                image_index += 1
-                            else:
-                                log_content.append(item)
-                        log_msg['content'] = log_content
-                    log_messages.append(log_msg)
-                log_payload['messages'] = log_messages
-            
-            logging.info(f"请求参数: {json.dumps(log_payload, ensure_ascii=False, indent=2)}")
-            
-            # 发送异步请求(带重试机制)
-            retry_times = 0
-            while retry_times <= self.retry_count:
-                try:
-                    # 添加随机延迟，避免同时发送大量请求
-                    import random
-                    await asyncio.sleep(random.uniform(0.1, 0.5))  # 异步延迟，时间缩短
-                    
-                    # 使用aiohttp发送异步请求
-                    timeout = aiohttp.ClientTimeout(total=600)
-                    
-                    # 使用统一的SSL配置
-                    ssl_context = setup_ssl_context()
-                    connector = aiohttp.TCPConnector(ssl=ssl_context)
-                    
-                    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                        async with session.post(
-                            api_url, 
-                            headers=headers, 
-                            json=payload
-                        ) as response:
-                            # 记录响应信息
-                            logging.info(f"API响应状态码: {response.status}")
-                            response_text = await response.text()
-                            logging.info(f"API响应内容: {response_text}")
-                            
-                            response.raise_for_status()
-                            data = await response.json()
-
-                            # 使用标准OpenAI兼容格式解析响应（适用于所有模型）
-                            content = data["choices"][0]["message"]["content"]
-
-                            # 记录完整响应内容用于调试
-                            logging.info(f"API响应内容 ({self.model_type}): {content}")
-
-                            # 根据模型类型使用不同的解析策略
-                            if self.model_type == "nano-banana":
-                                # nano-banana (Gemini) 模型可能直接返回base64图片数据或不同格式
-                                image_url = None
-
-                                # 1. 检查是否包含base64数据
-                                base64_match = re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', content)
-                                if base64_match:
-                                    image_url = base64_match.group(0)  # 完整的data:image格式
-                                    logging.info(f"找到base64图片数据: {image_url[:100]}...")
-                                else:
-                                    # 2. 尝试常见的URL格式
-                                    url_patterns = [
-                                        r'\[点击下载\]\((.*?)\)',
-                                        r'!\[图片\]\((.*?)\)',
-                                        r'!\[.*?\]\((.*?)\)',
-                                        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-                                        r'generated_image[^\\s]*\.(?:png|jpg|jpeg|gif|webp)',
-                                        r'https://[^\\s]+\.(?:png|jpg|jpeg|gif|webp)',
-                                    ]
-
-                                    for pattern in url_patterns:
-                                        match = re.search(pattern, content)
-                                        if match:
-                                            if pattern.startswith('http'):
-                                                image_url = match.group(0)
-                                            else:
-                                                image_url = match.group(1)
-                                            logging.info(f"使用模式 '{pattern}' 找到图片URL: {image_url}")
-                                            break
-
-                                if image_url:
-                                    self.signals.finished.emit(self.prompt, image_url, self.number or "")
-                                    return
-                                else:
-                                    # 如果都没找到，记录完整响应用于调试
-                                    logging.error(f"nano-banana模型响应解析失败，完整响应: {content}")
-                                    error_msg = f"nano-banana模型响应中没有找到图片数据。响应内容: {content[:200]}..."
-                                    logging.error(error_msg)
-                                    raise ValueError(error_msg)
-
-                            else:
-                                # sora_image 模型使用原有逻辑
-                                image_url_match = re.search(r'\[点击下载\]\((.*?)\)', content)
-                                if not image_url_match:
-                                    image_url_match = re.search(r'!\[图片\]\((.*?)\)', content)
-
-                                if image_url_match:
-                                    image_url = image_url_match.group(1)
-                                    logging.info(f"成功提取图片URL: {image_url}")
-                                    self.signals.finished.emit(self.prompt, image_url, self.number or "")
-                                    return
-
-                                error_msg = f"sora_image模型响应中没有找到图片URL。响应内容: {content[:200]}..."
-                                logging.error(error_msg)
-                                raise ValueError(error_msg)
-                        
-                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-                    retry_times += 1
-                    if retry_times <= self.retry_count:
-                        logging.warning(f"请求失败,正在进行第{retry_times}次重试: {str(e)}")
-                        self.signals.progress.emit(self.prompt, f"重试中 ({retry_times}/{self.retry_count})...")
-                        await asyncio.sleep(1)  # 异步延迟
-                        continue
-                    else:
-                        error_msg = f"请求失败(已重试{self.retry_count}次): {str(e)}"
-                        logging.error(error_msg)
-                        self.signals.error.emit(self.prompt, error_msg)
-                        return
-                        
+            # 使用抽象的 API 客户端发送请求并解析
+            from services.api_client import generate_image_async
+            url_or_data = await generate_image_async(
+                prompt=self.prompt,
+                image_data=self.image_data,
+                api_platform=self.api_platform,
+                model_type=self.model_type,
+                api_key=self.api_key,
+                allow_insecure_ssl=getattr(self, 'allow_insecure_ssl', False),
+                retry_count=self.retry_count,
+                app_path=APP_PATH,
+            )
+            self.signals.finished.emit(self.prompt, url_or_data, self.number or "")
+        except asyncio.CancelledError:
+            self.signals.error.emit(self.prompt, "任务已取消")
         except Exception as e:
-            error_msg = f"发生错误: {str(e)}"
-            logging.error(error_msg)
-            self.signals.error.emit(self.prompt, error_msg)
+            self.signals.error.emit(self.prompt, f"请求失败: {e}")
 
 class KeyEditDialog(QDialog):
     """密钥编辑对话框"""
@@ -761,6 +308,7 @@ class SettingsDialog(QDialog):
             self.retry_count = parent.retry_count
             self.save_path = parent.save_path
             self.image_ratio = parent.image_ratio
+            self.allow_insecure_ssl = getattr(parent, 'allow_insecure_ssl', False)
             self.style_library = parent.style_library.copy()
             self.category_links = parent.category_links.copy()
             self.current_style = parent.current_style
@@ -775,6 +323,7 @@ class SettingsDialog(QDialog):
             self.retry_count = 3
             self.save_path = ""
             self.image_ratio = "3:2"
+            self.allow_insecure_ssl = False
             self.style_library = {}
             self.category_links = {}
             self.current_style = ""
@@ -914,6 +463,12 @@ class SettingsDialog(QDialog):
         self.model_combo = QComboBox()
         self.model_combo.addItems(["sora_image", "nano-banana"])
         params_layout.addWidget(self.model_combo, 1, 3)
+
+        # SSL 安全设置
+        params_layout.addWidget(QLabel("网络安全:"), 2, 0)
+        self.ssl_checkbox = QCheckBox("允许不安全连接 (跳过证书验证)")
+        self.ssl_checkbox.setToolTip("仅在受信网络或调试时启用。默认关闭以确保安全。")
+        params_layout.addWidget(self.ssl_checkbox, 2, 1, 1, 3)
         
         layout.addWidget(params_group)
         
@@ -1295,6 +850,7 @@ class SettingsDialog(QDialog):
         self.path_input.setText(self.save_path)
         self.ratio_combo.setCurrentText(self.image_ratio)
         self.model_combo.setCurrentText(self.model_type)
+        self.ssl_checkbox.setChecked(self.allow_insecure_ssl)
         
         # 风格库
         self.refresh_style_combo()
@@ -1327,6 +883,7 @@ class SettingsDialog(QDialog):
             self.parent().custom_style_content = self.custom_style_content
             self.parent().key_library = self.key_library
             self.parent().current_key_name = self.current_key_name
+            self.parent().allow_insecure_ssl = self.ssl_checkbox.isChecked()
             
             # 刷新主窗口界面
             self.parent().refresh_ui_after_settings()
@@ -2808,7 +2365,7 @@ class HistoryDialog(QDialog):
 
     def refresh_history_list(self):
         """刷新历史记录列表"""
-        history_files = get_history_files()
+        history_files = get_history_files(APP_PATH)
 
         self.history_table.setRowCount(len(history_files))
 
@@ -2897,7 +2454,7 @@ class HistoryDialog(QDialog):
         }
 
         # 保存历史记录
-        saved_path = save_history_record(parent.prompt_table_data, config_data, filename)
+        saved_path = save_history_record(parent.prompt_table_data, config_data, APP_PATH, filename)
 
         if saved_path:
             QMessageBox.information(
@@ -3398,6 +2955,7 @@ class MainWindow(QMainWindow):
         self.api_key = ""
         self.api_platform = "云雾"
         self.model_type = "sora_image"  # 默认使用sora_image模型
+        self.allow_insecure_ssl = False
         self.thread_count = 5
         self.retry_count = 3
         self.save_path = ""
@@ -3442,7 +3000,7 @@ class MainWindow(QMainWindow):
         ensure_images_directory()
 
         # 确保历史记录目录存在
-        ensure_history_directory()
+        ensure_history_directory(APP_PATH)
         
         # 为现有分类创建目录（兼容旧版本）
         for category_name in self.category_links.keys():
@@ -5355,7 +4913,7 @@ class MainWindow(QMainWindow):
             else:
                 # 原有的HTTP下载逻辑
                 # 使用aiohttp异步下载图片
-                ssl_context = setup_ssl_context()
+                ssl_context = setup_ssl_context(getattr(self, 'allow_insecure_ssl', False))
                 connector = aiohttp.TCPConnector(ssl=ssl_context)
                 timeout = aiohttp.ClientTimeout(total=300)  # 5分钟超时
 
@@ -5578,7 +5136,7 @@ class MainWindow(QMainWindow):
             }
 
             # 保存历史记录
-            saved_path = save_history_record(self.prompt_table_data, config_data, filename)
+            saved_path = save_history_record(self.prompt_table_data, config_data, APP_PATH, filename)
 
             if saved_path:
                 logging.info(f"自动保存历史记录成功: {saved_path}")
@@ -5657,6 +5215,7 @@ class MainWindow(QMainWindow):
                 self.retry_count = config.get('retry_count', 3)
                 self.save_path = config.get('save_path', '')
                 self.image_ratio = config.get('image_ratio', '3:2')
+                self.allow_insecure_ssl = config.get('allow_insecure_ssl', False)
                 
                 # 加载风格库
                 self.style_library = config.get('style_library', {})
@@ -5704,6 +5263,7 @@ class MainWindow(QMainWindow):
                 'retry_count': self.retry_count,
                 'save_path': self.save_path,
                 'image_ratio': self.image_ratio,
+                'allow_insecure_ssl': self.allow_insecure_ssl,
                 'style_library': self.style_library,
                 'current_style': self.current_style,
                 'custom_style_content': self.custom_style_content,
@@ -5747,7 +5307,19 @@ class MainWindow(QMainWindow):
         event.accept()
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec()) 
+    # 使用 qasync 将 Qt 与 asyncio 事件循环整合
+    try:
+        from qasync import QEventLoop
+        app = QApplication(sys.argv)
+        loop = QEventLoop(app)
+        asyncio.set_event_loop(loop)
+        window = MainWindow()
+        window.show()
+        with loop:
+            sys.exit(loop.run_forever())
+    except Exception:
+        # 回退到原始方式，确保在缺少依赖时仍可运行
+        app = QApplication(sys.argv)
+        window = MainWindow()
+        window.show()
+        sys.exit(app.exec())
