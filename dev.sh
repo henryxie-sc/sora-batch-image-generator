@@ -136,24 +136,63 @@ release_to_main() {
     run_tests
 
     print_warning "即将合并develop到main分支，这将创建新的发布版本"
-    echo "确认继续？(y/N)"
+    echo "请输入新版本号 (如: 3.5.0):"
+    read -r version
+
+    if [ -z "$version" ]; then
+        print_error "版本号不能为空"
+        return 1
+    fi
+
+    echo "请输入版本更新说明:"
+    read -r release_notes
+
+    if [ -z "$release_notes" ]; then
+        print_error "更新说明不能为空"
+        return 1
+    fi
+
+    # 更新CHANGELOG
+    print_info "更新CHANGELOG..."
+    # 在CHANGELOG中添加新版本信息
+    sed -i.bak "s/## \[Unreleased\] - 开发中/## [Unreleased] - 开发中\n\n## [$version] - $(date +%Y-%m-%d)\n\n### 更新内容\n- $release_notes/" CHANGELOG.md
+
+    # 提交CHANGELOG更新
+    git add CHANGELOG.md
+    git commit -m "docs: 更新CHANGELOG for v$version"
+
+    print_warning "确认发布版本 v$version 到main分支？(y/N)"
     read -r confirm
 
     if [[ ! $confirm =~ ^[Yy]$ ]]; then
         print_info "发布已取消"
+        # 恢复CHANGELOG
+        mv CHANGELOG.md.bak CHANGELOG.md
+        git reset --hard HEAD~1
         return
     fi
 
     # 切换到main并合并
     git checkout main
     git pull origin main
-    git merge develop --no-ff
-    git push origin main
+    git merge develop --no-ff -m "release: v$version
 
-    print_success "已发布到main分支"
+$release_notes"
+
+    # 创建版本标签
+    git tag -a "v$version" -m "Release v$version: $release_notes"
+
+    # 推送到远程
+    git push origin main
+    git push origin "v$version"
+
+    print_success "已发布版本 v$version 到main分支"
 
     # 回到develop分支
     git checkout develop
+
+    # 清理备份文件
+    rm -f CHANGELOG.md.bak
 }
 
 # 显示帮助
